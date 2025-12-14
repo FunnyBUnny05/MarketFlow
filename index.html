@@ -64,6 +64,11 @@
         .sector-list {
             width: 320px; border-left: 1px solid #1a1a2e; overflow-y: auto;
             display: flex; flex-direction: column;
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* IE/Edge */
+        }
+        .sector-list::-webkit-scrollbar {
+            display: none; /* Chrome, Safari, Opera */
         }
         .sector-list-header {
             padding: 12px 15px; border-bottom: 1px solid #1a1a2e;
@@ -79,8 +84,8 @@
         .sector-row.selected { background: #1a1a2e; border-left: 3px solid #fff; }
         .sector-info { display: flex; align-items: center; gap: 8px; }
         .sector-info .dot { width: 8px; height: 8px; border-radius: 50%; }
-        .sector-info .ticker { font-weight: 600; font-size: 0.85rem; }
-        .sector-info .name { color: #666; font-size: 0.75rem; }
+        .sector-info .ticker { font-weight: 600; font-size: 1.1rem; }
+        .sector-info .name { color: #666; font-size: 0.95rem; }
         .sector-data { text-align: right; }
         .sector-data .zscore { font-weight: 600; font-size: 0.9rem; display: block; }
         .sector-data .zscore.negative { color: #ef4444; }
