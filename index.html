@@ -39,7 +39,14 @@
         .main { display: flex; height: calc(100vh - 60px); max-height: calc(100vh - 60px); }
         
         /* Chart Area */
-        .chart-area { flex: 1; padding: 20px; display: flex; flex-direction: column; overflow-y: auto; }
+        .chart-area {
+            flex: 1; padding: 20px; display: flex; flex-direction: column; overflow-y: auto;
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* IE/Edge */
+        }
+        .chart-area::-webkit-scrollbar {
+            display: none; /* Chrome, Safari, Opera */
+        }
         .chart-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .chart-head .title { font-size: 1.3rem; font-weight: 600; }
         .chart-head .title .tk { color: #666; font-weight: 400; font-size: 1rem; margin-left: 8px; }
@@ -77,23 +84,23 @@
         }
         .sector-row {
             display: flex; justify-content: space-between; align-items: center;
-            padding: 10px 15px; border-bottom: 1px solid #111; cursor: pointer;
+            padding: 14px 16px; border-bottom: 1px solid #111; cursor: pointer;
             transition: background 0.15s;
         }
         .sector-row:hover { background: #12121a; }
         .sector-row.selected { background: #1a1a2e; border-left: 3px solid #fff; }
-        .sector-info { display: flex; align-items: center; gap: 8px; }
-        .sector-info .dot { width: 8px; height: 8px; border-radius: 50%; }
-        .sector-info .ticker { font-weight: 600; font-size: 1.1rem; }
-        .sector-info .name { color: #666; font-size: 0.95rem; }
+        .sector-info { display: flex; align-items: center; gap: 10px; }
+        .sector-info .dot { width: 10px; height: 10px; border-radius: 50%; }
+        .sector-info .ticker { font-weight: 600; font-size: 1.25rem; }
+        .sector-info .name { color: #666; font-size: 1.05rem; }
         .sector-data { text-align: right; }
-        .sector-data .zscore { font-weight: 600; font-size: 0.9rem; display: block; }
+        .sector-data .zscore { font-weight: 600; font-size: 1.1rem; display: block; }
         .sector-data .zscore.negative { color: #ef4444; }
         .sector-data .zscore.positive { color: #22c55e; }
         .sector-data .zscore.neutral { color: #888; }
         .sector-data .signal {
-            font-size: 0.55rem; padding: 2px 5px; border-radius: 3px;
-            display: inline-block; margin-top: 2px;
+            font-size: 0.65rem; padding: 3px 6px; border-radius: 4px;
+            display: inline-block; margin-top: 3px;
         }
         .signal.cyclical-low { background: rgba(239,68,68,0.2); color: #ef4444; }
         .signal.cheap { background: rgba(251,191,36,0.2); color: #fbbf24; }
