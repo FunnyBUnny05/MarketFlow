@@ -1,6 +1,41 @@
 // Sector Z-Score Dashboard v4 - Simplified
 // Single sector view with S&P 500 comparison
 
+// Sector codes for Yahoo Finance screener
+const SECTOR_CODES = {
+    'XLB': 'Basic Materials',
+    'XLE': 'Energy',
+    'XLF': 'Financial Services',
+    'XLI': 'Industrials',
+    'XLK': 'Technology',
+    'XLP': 'Consumer Defensive',
+    'XLU': 'Utilities',
+    'XLV': 'Healthcare',
+    'XLY': 'Consumer Cyclical',
+    'XLRE': 'Real Estate',
+    'XLC': 'Communication Services',
+    'SMH': 'Technology',  // Semis are in tech
+    'XHB': 'Consumer Cyclical',  // Homebuilders
+    'XOP': 'Energy',
+    'XME': 'Basic Materials',
+    'KRE': 'Financial Services',
+    'XBI': 'Healthcare',
+    'ITB': 'Consumer Cyclical',
+    'IYT': 'Industrials',
+};
+
+// Industry filters for sub-sector ETFs
+const INDUSTRY_FILTERS = {
+    'SMH': ['Semiconductors', 'Semiconductor Equipment'],
+    'XHB': ['Residential Construction', 'Building Products'],
+    'XOP': ['Oil & Gas E&P', 'Oil & Gas Drilling'],
+    'XME': ['Steel', 'Aluminum', 'Copper', 'Other Industrial Metals', 'Gold', 'Silver'],
+    'KRE': ['Banks—Regional'],
+    'XBI': ['Biotechnology'],
+    'ITB': ['Residential Construction', 'Building Products'],
+    'IYT': ['Railroads', 'Trucking', 'Airlines', 'Integrated Freight'],
+};
+
 const SECTORS = [
     { ticker: 'XLB', name: 'Materials', color: '#f97316' },
     { ticker: 'XLE', name: 'Energy', color: '#3b82f6' },
@@ -146,6 +181,117 @@ async function fetchPrices(ticker) {
     try { return await fetchYahoo(ticker); } catch { return await fetchStooq(ticker); }
 }
 
+async function fetchHoldingsData(sectorTicker) {
+    const sectorName = SECTOR_CODES[sectorTicker];
+    if (!sectorName) return [];
+    
+    const cacheKey = `movers:${sectorTicker}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data; // 5 min cache
+    
+    try {
+        // Fetch most actives from Yahoo
+        const url = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=200';
+        const text = await fetchWithRace(url, 12000);
+        const data = JSON.parse(text);
+        const quotes = data?.finance?.result?.[0]?.quotes || [];
+        
+        // Filter by sector (and industry for sub-sector ETFs)
+        const industries = INDUSTRY_FILTERS[sectorTicker];
+        const filtered = quotes.filter(q => {
+            // Must match sector
+            if (!q.sector || q.sector !== sectorName) return false;
+            // For sub-sector ETFs, also filter by industry
+            if (industries && q.industry) {
+                const matchesIndustry = industries.some(ind => 
+                    q.industry.toLowerCase().includes(ind.toLowerCase()) ||
+                    ind.toLowerCase().includes(q.industry.toLowerCase())
+                );
+                if (!matchesIndustry) return false;
+            }
+            return true;
+        });
+        
+        // Sort by volume descending
+        filtered.sort((a, b) => (b.regularMarketVolume || 0) - (a.regularMarketVolume || 0));
+        
+        const results = filtered.slice(0, 10).map(q => ({
+            symbol: q.symbol,
+            name: (q.shortName || q.longName || q.symbol).substring(0, 30),
+            price: q.regularMarketPrice || 0,
+            change: q.regularMarketChangePercent || 0,
+            volume: q.regularMarketVolume || 0
+        }));
+        
+        if (results.length > 0) {
+            _cache.set(cacheKey, { ts: Date.now(), data: results });
+            return results;
+        }
+        
+        // If no results from most_actives, try day_gainers and day_losers
+        return await fetchGainersLosersForSector(sectorTicker, sectorName, industries);
+    } catch (e) {
+        console.log('Most actives failed:', e);
+        return await fetchGainersLosersForSector(sectorTicker, sectorName, INDUSTRY_FILTERS[sectorTicker]);
+    }
+}
+
+async function fetchGainersLosersForSector(sectorTicker, sectorName, industries) {
+    const cacheKey = `gainloss:${sectorTicker}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data;
+    
+    try {
+        const [gainersRes, losersRes] = await Promise.allSettled([
+            fetchWithRace('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=100', 10000),
+            fetchWithRace('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_losers&count=100', 10000)
+        ]);
+        
+        let allQuotes = [];
+        
+        if (gainersRes.status === 'fulfilled') {
+            const data = JSON.parse(gainersRes.value);
+            allQuotes.push(...(data?.finance?.result?.[0]?.quotes || []));
+        }
+        if (losersRes.status === 'fulfilled') {
+            const data = JSON.parse(losersRes.value);
+            allQuotes.push(...(data?.finance?.result?.[0]?.quotes || []));
+        }
+        
+        // Filter by sector
+        const filtered = allQuotes.filter(q => {
+            if (!q.sector || q.sector !== sectorName) return false;
+            if (industries && q.industry) {
+                const matchesIndustry = industries.some(ind => 
+                    q.industry.toLowerCase().includes(ind.toLowerCase()) ||
+                    ind.toLowerCase().includes(q.industry.toLowerCase())
+                );
+                if (!matchesIndustry) return false;
+            }
+            return true;
+        });
+        
+        // Sort by absolute change (biggest movers)
+        filtered.sort((a, b) => Math.abs(b.regularMarketChangePercent || 0) - Math.abs(a.regularMarketChangePercent || 0));
+        
+        const results = filtered.slice(0, 10).map(q => ({
+            symbol: q.symbol,
+            name: (q.shortName || q.longName || q.symbol).substring(0, 30),
+            price: q.regularMarketPrice || 0,
+            change: q.regularMarketChangePercent || 0,
+            volume: q.regularMarketVolume || 0
+        }));
+        
+        if (results.length > 0) {
+            _cache.set(cacheKey, { ts: Date.now(), data: results });
+        }
+        return results;
+    } catch (e) {
+        console.log('Gainers/losers also failed:', e);
+        return [];
+    }
+}
+
 function calculateZScoreData(sectorPrices) {
     const retYears = parseInt(document.getElementById('returnPeriod').value);
     const zYears = parseInt(document.getElementById('zscoreWindow').value);
@@ -261,10 +407,66 @@ function renderChart() {
             <div class="legend"><span><i style="background:${s.color}"></i>${s.ticker}</span><span><i style="background:rgba(255,255,255,0.5)"></i>${bench}</span></div>
             <div class="chart-wrap price-chart"><canvas id="priceChart"></canvas></div>
         </div>
+        
+        <div class="chart-section">
+            <div class="chart-label">Today's Most Active in Sector</div>
+            <div id="holdingsTable" class="holdings-loading">Loading active stocks...</div>
+        </div>
     `;
     
     createZScoreChart(selectedSector, s.color);
     createPriceChart(selectedSector, s.color, bench);
+    loadHoldings(selectedSector);
+}
+
+async function loadHoldings(sectorTicker) {
+    const container = document.getElementById('holdingsTable');
+    if (!container) return;
+    
+    try {
+        const holdings = await fetchHoldingsData(sectorTicker);
+        
+        if (!holdings.length) {
+            container.innerHTML = '<div class="holdings-empty">No holdings data available</div>';
+            return;
+        }
+        
+        container.innerHTML = `
+            <table class="holdings">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Symbol</th>
+                        <th>Name</th>
+                        <th>Price</th>
+                        <th>Change</th>
+                        <th>Volume</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${holdings.map((h, i) => `
+                        <tr>
+                            <td class="rank">${i + 1}</td>
+                            <td class="symbol">${h.symbol}</td>
+                            <td class="name">${h.name}</td>
+                            <td class="price">$${h.price.toFixed(2)}</td>
+                            <td class="change ${h.change >= 0 ? 'positive' : 'negative'}">${h.change >= 0 ? '+' : ''}${h.change.toFixed(2)}%</td>
+                            <td class="volume">${formatVolume(h.volume)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+    } catch (e) {
+        container.innerHTML = '<div class="holdings-empty">Failed to load holdings</div>';
+    }
+}
+
+function formatVolume(vol) {
+    if (vol >= 1e9) return (vol / 1e9).toFixed(1) + 'B';
+    if (vol >= 1e6) return (vol / 1e6).toFixed(1) + 'M';
+    if (vol >= 1e3) return (vol / 1e3).toFixed(1) + 'K';
+    return vol.toString();
 }
 
 let zscoreChartInstance = null;
