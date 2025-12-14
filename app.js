@@ -743,25 +743,64 @@ function renderChart() {
             <div class="title" style="color:${s.color}">${s.name} <span class="tk">${s.ticker}</span></div>
             <div class="zscore-display"><span class="label">Z-Score:</span><span class="val ${valCls}">${valStr}</span></div>
         </div>
-        
+
         <div class="info-panels">
-            <div class="panel data-quality ${qualityWarning}">
-                <div class="panel-title">Data Quality</div>
-                <div class="panel-row"><span>Source:</span><span>${quality.source || 'N/A'}</span></div>
-                <div class="panel-row"><span>Points:</span><span>${quality.pointCount || 0} weeks</span></div>
-                <div class="panel-row"><span>Range:</span><span>${quality.startDate?.toLocaleDateString() || '?'} - ${quality.endDate?.toLocaleDateString() || '?'}</span></div>
-                <div class="panel-row"><span>Alignment:</span><span class="${qualityWarning}">${quality.alignmentPct || 0}%</span></div>
-                ${quality.missedCount > 5 ? `<div class="panel-warning">⚠ ${quality.missedCount} points couldn't align to benchmark</div>` : ''}
+            <div class="panel data-quality-new ${qualityWarning}">
+                <div class="panel-header">
+                    <div class="panel-title-new">📊 Data Quality</div>
+                    <div class="quality-badge ${qualityWarning}">
+                        ${qualityWarning === 'good' ? '✓ Excellent' : qualityWarning === 'caution' ? '⚠ Fair' : '⚠ Low'}
+                    </div>
+                </div>
+
+                <div class="quality-metrics">
+                    <div class="metric-group">
+                        <div class="metric-label">Data Source</div>
+                        <div class="metric-value">${quality.source || 'N/A'}</div>
+                    </div>
+
+                    <div class="metric-group">
+                        <div class="metric-label">Coverage</div>
+                        <div class="metric-value">${quality.pointCount || 0} weeks</div>
+                        <div class="metric-sublabel">${quality.startDate ? quality.startDate.toLocaleDateString('en-US', {month: 'short', year: 'numeric'}) : '?'} to ${quality.endDate ? quality.endDate.toLocaleDateString('en-US', {month: 'short', year: 'numeric'}) : '?'}</div>
+                    </div>
+
+                    <div class="metric-group highlight">
+                        <div class="metric-label">Alignment</div>
+                        <div class="metric-value-large ${qualityWarning}">${quality.alignmentPct || 0}%</div>
+                        <div class="metric-sublabel">${quality.missedCount || 0} points misaligned</div>
+                    </div>
+                </div>
             </div>
-            
+
             ${rotation ? `
-            <div class="panel rotation-trigger">
-                <div class="panel-title">Rotation Trigger</div>
-                <div class="panel-row"><span>Setup:</span><span class="${rotation.setup.toLowerCase()}">${rotation.setup}</span></div>
-                <div class="panel-row"><span>RS vs 30w MA:</span><span class="${rotation.aboveMA ? 'positive' : 'negative'}">${rotation.aboveMA ? 'ABOVE' : 'BELOW'} (${rotation.rsVsMa}%)</span></div>
-                <div class="panel-row"><span>RS Trend:</span><span class="${rotation.trending === 'UP' ? 'positive' : rotation.trending === 'DOWN' ? 'negative' : ''}">${rotation.trending}</span></div>
-                <div class="trigger-signal ${rotation.trigger.includes('BUY') ? 'buy' : rotation.trigger.includes('SELL') ? 'sell' : 'wait'}">
-                    ${rotation.trigger}
+            <div class="panel rotation-trigger-new">
+                <div class="panel-header">
+                    <div class="panel-title-new">🎯 Market Signal</div>
+                    <div class="setup-badge ${rotation.setup.toLowerCase()}">${rotation.setup}</div>
+                </div>
+
+                <div class="signal-main">
+                    <div class="trigger-action ${rotation.trigger.includes('BUY') ? 'buy' : rotation.trigger.includes('SELL') ? 'sell' : 'wait'}">
+                        ${rotation.trigger}
+                    </div>
+                </div>
+
+                <div class="rotation-metrics">
+                    <div class="rotation-row">
+                        <div class="rotation-label">Relative Strength</div>
+                        <div class="rotation-value ${rotation.aboveMA ? 'positive' : 'negative'}">
+                            ${rotation.aboveMA ? '↑' : '↓'} ${rotation.aboveMA ? 'Above' : 'Below'} MA
+                            <span class="rotation-pct">(${rotation.rsVsMa > 0 ? '+' : ''}${rotation.rsVsMa}%)</span>
+                        </div>
+                    </div>
+
+                    <div class="rotation-row">
+                        <div class="rotation-label">Trend</div>
+                        <div class="rotation-value ${rotation.trending === 'UP' ? 'positive' : rotation.trending === 'DOWN' ? 'negative' : ''}">
+                            ${rotation.trending === 'UP' ? '📈 Trending Up' : rotation.trending === 'DOWN' ? '📉 Trending Down' : '➡️ Flat'}
+                        </div>
+                    </div>
                 </div>
             </div>
             ` : ''}
