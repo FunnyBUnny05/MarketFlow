@@ -264,66 +264,95 @@ async function fetchPrices(ticker) {
 
 // ============ Z-SCORE CALCULATIONS ============
 
-function calculateZScoreData(sectorPrices) {
+function calcRollingReturnPct(prices, weeks) {
+    const out = [];
+    for (let i = weeks; i < prices.length; i++) {
+        const a = prices[i - weeks]?.close;
+        const b = prices[i]?.close;
+        if (a && b && a > 0 && b > 0) {
+            out.push({ date: prices[i].date, value: ((b / a) - 1) * 100 });
+        }
+    }
+    return out;
+}
+
+// Build benchmark index for fast nearest-date lookup
+function buildReturnIndex(retSeries) {
+    const times = retSeries.map(r => r.date.getTime());
+    const values = retSeries.map(r => r.value);
+    return { times, values };
+}
+
+// Binary search nearest neighbor lookup
+function nearestValue(index, ts, maxDeltaDays = 10) {
+    const { times, values } = index;
+    if (!times.length) return null;
+
+    let lo = 0, hi = times.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] < ts) lo = mid + 1;
+        else hi = mid;
+    }
+
+    const DAY_MS = 86400000;
+    const maxDelta = maxDeltaDays * DAY_MS;
+
+    let bestIdx = lo;
+    let bestDist = Math.abs(times[lo] - ts);
+
+    if (lo > 0) {
+        const d2 = Math.abs(times[lo - 1] - ts);
+        if (d2 < bestDist) { bestDist = d2; bestIdx = lo - 1; }
+    }
+
+    if (bestDist > maxDelta) return null;
+    return values[bestIdx];
+}
+
+function calculateZScoreData(sectorPrices, benchIndex) {
     const retYears = parseInt(document.getElementById('returnPeriod')?.value || '3');
     const zYears = parseInt(document.getElementById('zscoreWindow')?.value || '10');
     const retWeeks = Math.round(retYears * 52);
     const zWeeks = Math.round(zYears * 52);
     
-    const calcRet = (prices, weeks) => {
-        const r = [];
-        for (let i = weeks; i < prices.length; i++) {
-            if (prices[i-weeks]?.close && prices[i]?.close) {
-                r.push({ date: prices[i].date, value: ((prices[i].close / prices[i-weeks].close) - 1) * 100 });
-            }
-        }
-        return r;
-    };
+    const sectorRet = calcRollingReturnPct(sectorPrices, retWeeks);
     
-    const sectorRet = calcRet(sectorPrices, retWeeks);
-    const benchRet = calcRet(benchmarkPrices, retWeeks);
-    
-    // Build benchmark map with timestamp (ms)
-    const benchMap = new Map();
-    benchRet.forEach(r => benchMap.set(r.date.getTime(), r.value));
-    
-    // Align by nearest timestamp within ±4 days
-    const DAY_MS = 24 * 60 * 60 * 1000;
+    // Align to benchmark by nearest weekly point (±10 days for weekly + holidays)
     const relRet = sectorRet.map(r => {
-        const targetTs = r.date.getTime();
-        let bv = benchMap.get(targetTs);
-        
-        if (bv === undefined) {
-            for (let offset = 1; offset <= 4; offset++) {
-                bv = benchMap.get(targetTs - offset * DAY_MS) ?? benchMap.get(targetTs + offset * DAY_MS);
-                if (bv !== undefined) break;
-            }
-        }
-        
-        return bv !== undefined ? { date: r.date, value: r.value - bv } : null;
+        const bv = nearestValue(benchIndex, r.date.getTime(), 10);
+        return bv == null ? null : { date: r.date, value: r.value - bv };
     }).filter(Boolean);
     
     const zscores = [];
-    const minW = Math.min(zWeeks, Math.floor(relRet.length * 0.3));
+    const minWindow = Math.min(zWeeks, relRet.length);
+    const warmup = Math.max(52, Math.floor(minWindow * 0.6)); // require real history
     
-    for (let i = minW; i < relRet.length; i++) {
-        const win = relRet.slice(Math.max(0, i - zWeeks), i).map(r => r.value);
-        if (win.length < 20) continue;
+    for (let i = warmup; i < relRet.length; i++) {
+        const start = Math.max(0, i - zWeeks);
+        const win = relRet.slice(start, i).map(r => r.value);
+        if (win.length < 30) continue;
         
         const mean = win.reduce((a, b) => a + b, 0) / win.length;
-        const std = Math.sqrt(win.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / win.length);
         
-        if (std > 0.5) {
-            zscores.push({ 
-                date: relRet[i].date, 
-                value: Math.max(-6, Math.min(6, (relRet[i].value - mean) / std)) 
-            });
-        }
+        // Sample std (N-1) is slightly better behaved
+        const denom = Math.max(1, win.length - 1);
+        const variance = win.reduce((a, b) => a + (b - mean) * (b - mean), 0) / denom;
+        const std = Math.sqrt(variance);
+        
+        if (std < 1e-6) continue; // truly flat, not just "low vol"
+        const z = (relRet[i].value - mean) / std;
+        
+        zscores.push({ date: relRet[i].date, value: Math.max(-6, Math.min(6, z)) });
     }
     
-    // Dedupe to monthly
+    // Dedupe monthly (keep last point in month)
     const monthly = new Map();
-    zscores.forEach(d => monthly.set(`${d.date.getFullYear()}-${String(d.date.getMonth()+1).padStart(2,'0')}`, d));
+    zscores.forEach(d => {
+        const k = `${d.date.getFullYear()}-${String(d.date.getMonth() + 1).padStart(2, '0')}`;
+        monthly.set(k, d);
+    });
+    
     return Array.from(monthly.values()).sort((a, b) => a.date - b.date);
 }
 
@@ -354,17 +383,33 @@ async function fetchSSGAHoldings(etfTicker) {
 
         const header = rows[headerIdx].map(x => String(x || '').trim().toLowerCase());
         const tickerCol = header.findIndex(h => h === 'ticker');
+        const weightCol = header.findIndex(h => h.includes('weight'));
+        
         if (tickerCol < 0) return [];
 
-        const tickers = [];
+        const holdings = [];
         for (let i = headerIdx + 1; i < rows.length; i++) {
             const t = String(rows[i]?.[tickerCol] || '').trim().toUpperCase();
             if (!t || t === '-' || t.length > 10) continue;
             if (t.includes(' ') || t.includes('/')) continue; // Skip non-equity
-            tickers.push(t);
+            
+            let weight = 0;
+            if (weightCol >= 0) {
+                const w = rows[i]?.[weightCol];
+                weight = typeof w === 'number' ? w : parseFloat(String(w).replace('%', '')) || 0;
+            }
+            
+            holdings.push({ ticker: t, weight });
         }
 
-        const unique = [...new Set(tickers)].slice(0, 100);
+        // Sort by weight descending, dedupe
+        holdings.sort((a, b) => b.weight - a.weight);
+        const seen = new Set();
+        const unique = holdings.filter(h => {
+            if (seen.has(h.ticker)) return false;
+            seen.add(h.ticker);
+            return true;
+        }).slice(0, 100);
         
         _cache.set(cacheKey, { ts: Date.now(), data: unique });
         saveCache();
@@ -397,34 +442,56 @@ async function fetchHoldingsData(sectorTicker) {
     if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data; // 5 min cache
 
     let holdings = [];
+    let hasWeights = false;
     
     // Try SSGA holdings for supported ETFs
     if (SSGA_ETFS.has(sectorTicker)) {
         holdings = await fetchSSGAHoldings(sectorTicker);
+        hasWeights = holdings.length > 0 && holdings[0].weight > 0;
     }
     
-    // Fallback to hardcoded list
+    // Fallback to hardcoded list (no weights)
     if (!holdings.length && FALLBACK_HOLDINGS[sectorTicker]) {
-        holdings = FALLBACK_HOLDINGS[sectorTicker];
+        holdings = FALLBACK_HOLDINGS[sectorTicker].map(t => ({ ticker: t, weight: 0 }));
     }
     
     if (!holdings.length) return [];
     
+    // Extract tickers for quote fetch
+    const tickers = holdings.map(h => h.ticker || h);
+    
     // Fetch quotes for holdings
-    const quotes = await fetchYahooQuotes(holdings.slice(0, 50));
+    const quotes = await fetchYahooQuotes(tickers.slice(0, 50));
     
     if (!quotes.length) return [];
     
-    // Sort by volume
-    quotes.sort((a, b) => (b.regularMarketVolume || 0) - (a.regularMarketVolume || 0));
+    // Build quote map
+    const quoteMap = new Map();
+    quotes.forEach(q => quoteMap.set(q.symbol, q));
     
-    const results = quotes.slice(0, 10).map(q => ({
-        symbol: q.symbol,
-        name: (q.shortName || q.longName || q.symbol).substring(0, 28),
-        price: q.regularMarketPrice || 0,
-        change: q.regularMarketChangePercent || 0,
-        volume: q.regularMarketVolume || 0
-    }));
+    // Build results with weight info
+    let results = holdings.slice(0, 50).map(h => {
+        const ticker = h.ticker || h;
+        const q = quoteMap.get(ticker);
+        if (!q) return null;
+        return {
+            symbol: q.symbol,
+            name: (q.shortName || q.longName || q.symbol).substring(0, 28),
+            price: q.regularMarketPrice || 0,
+            change: q.regularMarketChangePercent || 0,
+            volume: q.regularMarketVolume || 0,
+            weight: h.weight || 0
+        };
+    }).filter(Boolean);
+    
+    // Sort by weight if available, otherwise by volume
+    if (hasWeights) {
+        results.sort((a, b) => b.weight - a.weight);
+    } else {
+        results.sort((a, b) => b.volume - a.volume);
+    }
+    
+    results = results.slice(0, 10);
     
     if (results.length > 0) {
         _cache.set(cacheKey, { ts: Date.now(), data: results });
@@ -462,8 +529,8 @@ function renderSectorList() {
     container.innerHTML = sorted.map(s => {
         const z = sectorZScores[s.ticker]?.slice(-1)[0]?.value;
         const sel = selectedSector === s.ticker;
-        const sig = z === undefined ? '' : z < -2 ? 'cyclical-low' : z < -1 ? 'cheap' : z > 2 ? 'extended' : 'neutral';
-        const sigTxt = z === undefined ? '' : z < -2 ? 'CYCLICAL LOW' : z < -1 ? 'CHEAP' : z > 2 ? 'EXTENDED' : 'NEUTRAL';
+        const sig = z === undefined ? '' : z < -2 ? 'extreme-weak' : z < -1 ? 'weak' : z > 2 ? 'extreme-strong' : 'neutral';
+        const sigTxt = z === undefined ? '' : z < -2 ? 'EXTREME WEAK' : z < -1 ? 'WEAK' : z > 2 ? 'EXTREME STRONG' : 'NEUTRAL';
         const valCls = z === undefined ? '' : z < -1 ? 'negative' : z > 1 ? 'positive' : 'neutral';
         const valStr = z !== undefined ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}` : '...';
         
@@ -503,7 +570,7 @@ function renderChart() {
         </div>
         
         <div class="chart-section">
-            <div class="chart-label">Top Holdings by Volume</div>
+            <div class="chart-label">Top Holdings</div>
             <div id="holdingsTable" class="holdings-loading">Loading holdings...</div>
         </div>
     `;
@@ -618,6 +685,9 @@ async function loadHoldings(sectorTicker) {
             return;
         }
         
+        // Check if we have weight data
+        const hasWeights = holdings[0].weight > 0;
+        
         container.innerHTML = `
             <table class="holdings">
                 <thead>
@@ -627,7 +697,7 @@ async function loadHoldings(sectorTicker) {
                         <th>Name</th>
                         <th>Price</th>
                         <th>Change</th>
-                        <th>Volume</th>
+                        <th>${hasWeights ? 'Weight' : 'Volume'}</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -638,7 +708,7 @@ async function loadHoldings(sectorTicker) {
                             <td class="name">${h.name}</td>
                             <td class="price">$${h.price.toFixed(2)}</td>
                             <td class="change ${h.change >= 0 ? 'positive' : 'negative'}">${h.change >= 0 ? '+' : ''}${h.change.toFixed(2)}%</td>
-                            <td class="volume">${formatVolume(h.volume)}</td>
+                            <td class="volume">${hasWeights ? h.weight.toFixed(2) + '%' : formatVolume(h.volume)}</td>
                         </tr>
                     `).join('')}
                 </tbody>
@@ -663,10 +733,18 @@ async function refreshAllData() {
     isLoading = true;
     
     const bench = document.getElementById('benchmark')?.value || 'SPY';
+    const retYears = parseInt(document.getElementById('returnPeriod')?.value || '3');
+    const retWeeks = Math.round(retYears * 52);
+    
     setStatus('loading', `Loading ${bench}...`);
     
     try {
         benchmarkPrices = await fetchPrices(bench);
+        
+        // Precompute benchmark rolling returns ONCE
+        const benchRet = calcRollingReturnPct(benchmarkPrices, retWeeks);
+        const benchIndex = buildReturnIndex(benchRet);
+        
         setStatus('loading', 'Loading sectors (0/' + SECTORS.length + ')...');
         
         // Throttled fetch - 5 concurrent max
@@ -675,7 +753,7 @@ async function refreshAllData() {
             const prices = await fetchPrices(s.ticker);
             completed++;
             setStatus('loading', `Loading sectors (${completed}/${SECTORS.length})...`);
-            return { ticker: s.ticker, data: calculateZScoreData(prices) };
+            return { ticker: s.ticker, data: calculateZScoreData(prices, benchIndex) };
         });
         
         results.forEach((r, i) => {
