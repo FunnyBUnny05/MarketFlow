@@ -659,8 +659,12 @@ async function fetchHoldingsData(sectorTicker) {
                 coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex, sectorStats)
             }));
 
-            if (scored.some(s => s.coMoveScore != null)) {
-                results = scored.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
+            const scoredResults = scored
+                .filter(s => s.status === 'fulfilled' && s.value)
+                .map(s => s.value);
+
+            if (scoredResults.some(s => s.coMoveScore != null)) {
+                results = scoredResults.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
             }
         }
     } catch (e) {
