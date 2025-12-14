@@ -348,6 +348,27 @@ function calcRollingReturnPct(prices, weeks) {
     return out;
 }
 
+// Simple week-over-week returns
+function calcWeeklyReturns(prices) {
+    const out = [];
+    for (let i = 1; i < prices.length; i++) {
+        const prev = prices[i - 1];
+        const cur = prices[i];
+        if (prev?.close > 0 && cur?.close > 0) {
+            out.push({ date: cur.date, value: ((cur.close / prev.close) - 1) * 100 });
+        }
+    }
+    return out;
+}
+
+function calcReturnStats(values) {
+    if (!values.length) return { mean: 0, variance: 0, std: 0, count: 0 };
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const denom = Math.max(1, values.length - 1);
+    const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / denom;
+    return { mean, variance, std: Math.sqrt(variance), count: values.length };
+}
+
 // Build benchmark index for fast nearest-date lookup
 function buildReturnIndex(retSeries) {
     const times = retSeries.map(r => r.date.getTime());
@@ -530,6 +551,46 @@ async function fetchYahooQuotes(symbols) {
     }
 }
 
+async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
+    try {
+        const { prices } = await fetchPrices(symbol);
+        const stockReturns = calcWeeklyReturns(prices.slice(-110));
+
+        const pairs = [];
+        for (const r of stockReturns) {
+            const sv = nearestValue(sectorIndex, r.date.getTime(), 7);
+            if (sv == null) continue;
+            pairs.push({ stock: r.value, sector: sv });
+        }
+
+        if (pairs.length < 8 || sectorStats.std < 1e-6 || sectorStats.variance < 1e-6) return null;
+
+        const stockVals = pairs.map(p => p.stock);
+        const sectorVals = pairs.map(p => p.sector);
+        const stockStats = calcReturnStats(stockVals);
+        const sectorMean = sectorVals.reduce((a, b) => a + b, 0) / sectorVals.length;
+
+        if (stockStats.std < 1e-6) return null;
+
+        let cov = 0;
+        for (let i = 0; i < pairs.length; i++) {
+            cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - sectorMean);
+        }
+        cov /= Math.max(1, pairs.length - 1);
+
+        const corr = cov / (stockStats.std * sectorStats.std);
+        const beta = cov / sectorStats.variance;
+
+        if (!isFinite(corr) || !isFinite(beta) || corr <= 0 || beta <= 0) return null;
+
+        // Higher score = stronger positive correlation * sensitivity to sector moves
+        return corr * beta;
+    } catch (e) {
+        console.log(`Co-move calc failed for ${symbol}:`, e.message);
+        return null;
+    }
+}
+
 async function fetchHoldingsData(sectorTicker) {
     const cacheKey = `topstocks:${sectorTicker}`;
     const hit = _cache.get(cacheKey);
@@ -556,7 +617,7 @@ async function fetchHoldingsData(sectorTicker) {
     
     // Fetch quotes for holdings
     const quotes = await fetchYahooQuotes(tickers.slice(0, 50));
-    
+
     if (!quotes.length) return [];
     
     // Build quote map
@@ -577,16 +638,37 @@ async function fetchHoldingsData(sectorTicker) {
             weight: h.weight || 0
         };
     }).filter(Boolean);
-    
+
     // Sort by weight if available, otherwise by volume
     if (hasWeights) {
         results.sort((a, b) => b.weight - a.weight);
     } else {
         results.sort((a, b) => b.volume - a.volume);
     }
-    
+
+    // Calculate which holdings move most with the sector (beta * correlation)
+    try {
+        const sectorPriceData = await fetchPrices(sectorTicker);
+        const sectorReturns = calcWeeklyReturns(sectorPriceData.prices.slice(-110));
+        const sectorStats = calcReturnStats(sectorReturns.map(r => r.value));
+
+        if (sectorStats.count >= 10 && sectorStats.variance > 1e-6) {
+            const sectorIndex = buildReturnIndex(sectorReturns);
+            const scored = await mapLimit(results.slice(0, 15), 3, async r => ({
+                ...r,
+                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex, sectorStats)
+            }));
+
+            if (scored.some(s => s.coMoveScore != null)) {
+                results = scored.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
+            }
+        }
+    } catch (e) {
+        console.log('Co-move scoring skipped:', e.message);
+    }
+
     results = results.slice(0, 10);
-    
+
     if (results.length > 0) {
         _cache.set(cacheKey, { ts: Date.now(), data: results });
     }
@@ -932,10 +1014,11 @@ async function loadHoldings(sectorTicker) {
             container.innerHTML = '<div class="holdings-empty">No holdings data available</div>';
             return;
         }
-        
+
         // Check if we have weight data
         const hasWeights = holdings[0].weight > 0;
-        
+        const hasScores = holdings.some(h => h.coMoveScore != null);
+
         container.innerHTML = `
             <table class="holdings">
                 <thead>
@@ -945,6 +1028,7 @@ async function loadHoldings(sectorTicker) {
                         <th>Name</th>
                         <th>Price</th>
                         <th>Change</th>
+                        ${hasScores ? '<th>Co-Move</th>' : ''}
                         <th>${hasWeights ? 'Weight' : 'Volume'}</th>
                     </tr>
                 </thead>
@@ -956,6 +1040,7 @@ async function loadHoldings(sectorTicker) {
                             <td class="name">${h.name}</td>
                             <td class="price">$${h.price.toFixed(2)}</td>
                             <td class="change ${h.change >= 0 ? 'positive' : 'negative'}">${h.change >= 0 ? '+' : ''}${h.change.toFixed(2)}%</td>
+                            ${hasScores ? `<td class="volume">${h.coMoveScore != null ? h.coMoveScore.toFixed(2) : '-'}</td>` : ''}
                             <td class="volume">${hasWeights ? h.weight.toFixed(2) + '%' : formatVolume(h.volume)}</td>
                         </tr>
                     `).join('')}
