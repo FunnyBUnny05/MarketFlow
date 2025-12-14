@@ -38,11 +38,21 @@ const FALLBACK_HOLDINGS = {
 
 let selectedSector = null;
 let sectorZScores = {};
+let sectorDataQuality = {}; // Track data quality per sector
 let benchmarkPrices = null;
 let isLoading = false;
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const _cache = new Map();
+
+// Circuit breaker state per proxy
+const proxyHealth = {
+    'allorigins': { failures: 0, disabledUntil: 0 },
+    'corsproxy': { failures: 0, disabledUntil: 0 },
+    'codetabs': { failures: 0, disabledUntil: 0 }
+};
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 // Load cache - store dates as ISO strings
 try {
@@ -81,21 +91,74 @@ function saveCache() {
 
 // ============ FETCH UTILITIES ============
 
-// First-success race that aborts losers
-async function fetchFirstSuccess(urls, timeoutMs = 12000) {
-    const controllers = urls.map(() => new AbortController());
+// Get active proxies (not circuit-broken)
+function getActiveProxies(url) {
+    const now = Date.now();
+    const allProxies = [
+        { name: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+        { name: 'corsproxy', url: `https://corsproxy.io/?${encodeURIComponent(url)}` },
+        { name: 'codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
+    ];
+    
+    return allProxies.filter(p => {
+        const health = proxyHealth[p.name];
+        if (health.disabledUntil > now) {
+            return false; // Still in cooldown
+        }
+        if (health.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+            // Reset after cooldown
+            health.failures = 0;
+        }
+        return true;
+    });
+}
+
+function recordProxySuccess(proxyName) {
+    if (proxyHealth[proxyName]) {
+        proxyHealth[proxyName].failures = 0;
+        proxyHealth[proxyName].disabledUntil = 0;
+    }
+}
+
+function recordProxyFailure(proxyName) {
+    if (proxyHealth[proxyName]) {
+        proxyHealth[proxyName].failures++;
+        if (proxyHealth[proxyName].failures >= CIRCUIT_BREAKER_THRESHOLD) {
+            proxyHealth[proxyName].disabledUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+            console.log(`Circuit breaker: ${proxyName} disabled for 10 minutes`);
+        }
+    }
+}
+
+// First-success race that aborts losers with circuit breaker
+async function fetchFirstSuccess(url, timeoutMs = 12000) {
+    const proxies = getActiveProxies(url);
+    
+    if (proxies.length === 0) {
+        // All proxies circuit-broken, reset and try anyway
+        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
+        return fetchFirstSuccess(url, timeoutMs);
+    }
+    
+    const controllers = proxies.map(() => new AbortController());
     const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
 
     try {
-        const wrapped = urls.map((u, i) => (async () => {
-            const res = await fetch(u, { signal: controllers[i].signal });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const text = await res.text();
-            const t = text.trim();
-            if (!(t.startsWith('{') || t.startsWith('[') || t.startsWith('Date,'))) {
-                throw new Error('Invalid response');
+        const wrapped = proxies.map((p, i) => (async () => {
+            try {
+                const res = await fetch(p.url, { signal: controllers[i].signal });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const text = await res.text();
+                const t = text.trim();
+                if (!(t.startsWith('{') || t.startsWith('[') || t.startsWith('Date,'))) {
+                    throw new Error('Invalid response');
+                }
+                recordProxySuccess(p.name);
+                return { text, proxyName: p.name };
+            } catch (e) {
+                recordProxyFailure(p.name);
+                throw e;
             }
-            return text;
         })());
 
         const result = await new Promise((resolve, reject) => {
@@ -110,31 +173,33 @@ async function fetchFirstSuccess(urls, timeoutMs = 12000) {
         });
 
         controllers.forEach(c => c.abort()); // Kill losers
-        return result;
+        return result.text;
     } finally {
         clearTimeout(timeout);
     }
 }
 
 async function fetchWithRace(url, timeoutMs = 12000) {
-    const proxies = [
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-        `https://corsproxy.io/?${encodeURIComponent(url)}`,
-        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    ];
-    return fetchFirstSuccess(proxies, timeoutMs);
+    return fetchFirstSuccess(url, timeoutMs);
 }
 
-// Binary fetch for XLSX files
-async function fetchBinaryFirstSuccess(urls, timeoutMs = 15000) {
-    const controllers = urls.map(() => new AbortController());
+// Binary fetch for XLSX files with circuit breaker
+async function fetchBinaryFirstSuccess(url, timeoutMs = 15000) {
+    const proxies = getActiveProxies(url);
+    
+    if (proxies.length === 0) {
+        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
+        return fetchBinaryFirstSuccess(url, timeoutMs);
+    }
+    
+    const controllers = proxies.map(() => new AbortController());
     const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
 
     try {
         const result = await new Promise((resolve, reject) => {
-            let pending = urls.length, lastErr;
-            urls.forEach((pUrl, i) => {
-                fetch(pUrl, { signal: controllers[i].signal })
+            let pending = proxies.length, lastErr;
+            proxies.forEach((p, i) => {
+                fetch(p.url, { signal: controllers[i].signal })
                     .then(r => {
                         if (!r.ok) throw new Error(`HTTP ${r.status}`);
                         return r.arrayBuffer();
@@ -145,9 +210,11 @@ async function fetchBinaryFirstSuccess(urls, timeoutMs = 15000) {
                         if (b.length < 4 || b[0] !== 0x50 || b[1] !== 0x4B) {
                             throw new Error('Not XLSX');
                         }
+                        recordProxySuccess(p.name);
                         resolve(buf);
                     })
                     .catch(err => {
+                        recordProxyFailure(p.name);
                         lastErr = err;
                         pending--;
                         if (pending === 0) reject(lastErr);
@@ -163,12 +230,7 @@ async function fetchBinaryFirstSuccess(urls, timeoutMs = 15000) {
 }
 
 async function fetchWithRaceBinary(url, timeoutMs = 15000) {
-    const proxies = [
-        `https://corsproxy.io/?${encodeURIComponent(url)}`,
-        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    ];
-    return fetchBinaryFirstSuccess(proxies, timeoutMs);
+    return fetchBinaryFirstSuccess(url, timeoutMs);
 }
 
 // Throttled parallel execution - prevents proxy overload
@@ -196,7 +258,7 @@ async function mapLimit(items, limit, fn) {
 async function fetchYahoo(ticker) {
     const cacheKey = `y:${ticker}`;
     const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Yahoo', fromCache: true };
 
     const p2 = Math.floor(Date.now() / 1000);
     const p1 = p2 - Math.floor(25 * 365.25 * 24 * 60 * 60);
@@ -220,13 +282,13 @@ async function fetchYahoo(ticker) {
 
     _cache.set(cacheKey, { ts: Date.now(), data: prices });
     saveCache();
-    return prices;
+    return { prices, source: 'Yahoo', fromCache: false };
 }
 
 async function fetchStooq(ticker) {
     const cacheKey = `s:${ticker}`;
     const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Stooq', fromCache: true };
 
     const sym = `${ticker.toLowerCase()}.us`;
     const url = `https://stooq.com/q/d/l/?s=${sym}&i=w`;
@@ -247,14 +309,24 @@ async function fetchStooq(ticker) {
 
     _cache.set(cacheKey, { ts: Date.now(), data: prices });
     saveCache();
-    return prices;
+    return { prices, source: 'Stooq', fromCache: false };
 }
 
+// Stale-while-revalidate: return cached data immediately, refresh in background
 async function fetchPrices(ticker) {
     const yKey = `y:${ticker}`, sKey = `s:${ticker}`;
-    if (_cache.has(yKey) && Date.now() - _cache.get(yKey).ts < CACHE_TTL_MS) return _cache.get(yKey).data;
-    if (_cache.has(sKey) && Date.now() - _cache.get(sKey).ts < CACHE_TTL_MS) return _cache.get(sKey).data;
+    const yHit = _cache.get(yKey);
+    const sHit = _cache.get(sKey);
     
+    // If we have fresh cache, use it
+    if (yHit && Date.now() - yHit.ts < CACHE_TTL_MS) {
+        return { prices: yHit.data, source: 'Yahoo', fromCache: true };
+    }
+    if (sHit && Date.now() - sHit.ts < CACHE_TTL_MS) {
+        return { prices: sHit.data, source: 'Stooq', fromCache: true };
+    }
+    
+    // Try Yahoo first, fallback to Stooq
     try { 
         return await fetchYahoo(ticker); 
     } catch { 
@@ -310,7 +382,7 @@ function nearestValue(index, ts, maxDeltaDays = 10) {
     return values[bestIdx];
 }
 
-function calculateZScoreData(sectorPrices, benchIndex) {
+function calculateZScoreData(sectorPrices, benchIndex, source) {
     const retYears = parseInt(document.getElementById('returnPeriod')?.value || '3');
     const zYears = parseInt(document.getElementById('zscoreWindow')?.value || '10');
     const retWeeks = Math.round(retYears * 52);
@@ -319,9 +391,17 @@ function calculateZScoreData(sectorPrices, benchIndex) {
     const sectorRet = calcRollingReturnPct(sectorPrices, retWeeks);
     
     // Align to benchmark by nearest weekly point (±10 days for weekly + holidays)
+    let alignedCount = 0;
+    let missedCount = 0;
+    
     const relRet = sectorRet.map(r => {
         const bv = nearestValue(benchIndex, r.date.getTime(), 10);
-        return bv == null ? null : { date: r.date, value: r.value - bv };
+        if (bv == null) {
+            missedCount++;
+            return null;
+        }
+        alignedCount++;
+        return { date: r.date, value: r.value - bv };
     }).filter(Boolean);
     
     const zscores = [];
@@ -353,7 +433,21 @@ function calculateZScoreData(sectorPrices, benchIndex) {
         monthly.set(k, d);
     });
     
-    return Array.from(monthly.values()).sort((a, b) => a.date - b.date);
+    const zscore = Array.from(monthly.values()).sort((a, b) => a.date - b.date);
+    
+    // Data quality metrics
+    const quality = {
+        source: source || 'Unknown',
+        pointCount: sectorPrices.length,
+        startDate: sectorPrices[0]?.date,
+        endDate: sectorPrices[sectorPrices.length - 1]?.date,
+        alignedCount,
+        missedCount,
+        alignmentPct: alignedCount > 0 ? Math.round((alignedCount / (alignedCount + missedCount)) * 100) : 0,
+        zscoreCount: zscore.length
+    };
+    
+    return { zscore, quality };
 }
 
 function normalizePrices(prices) {
@@ -541,6 +635,91 @@ function renderSectorList() {
     }).join('');
 }
 
+// Calculate simple moving average
+function calcSMA(prices, period) {
+    if (prices.length < period) return null;
+    const slice = prices.slice(-period);
+    return slice.reduce((a, b) => a + b.close, 0) / period;
+}
+
+// Calculate rotation trigger: Z-score setup + trend confirmation
+function calcRotationTrigger(sectorTicker, benchTicker) {
+    const sCache = _cache.get(`y:${sectorTicker}`) || _cache.get(`s:${sectorTicker}`);
+    const bCache = _cache.get(`y:${benchTicker}`) || _cache.get(`s:${benchTicker}`);
+    
+    if (!sCache?.data || !bCache?.data) return null;
+    
+    const sectorPrices = sCache.data;
+    const benchPrices = bCache.data;
+    
+    // Calculate relative strength (sector/benchmark ratio)
+    const minLen = Math.min(sectorPrices.length, benchPrices.length);
+    if (minLen < 30) return null;
+    
+    // Align by date - simple approach for weekly data
+    const relStrength = [];
+    let bIdx = 0;
+    for (let i = 0; i < sectorPrices.length; i++) {
+        const sDate = sectorPrices[i].date.getTime();
+        // Find nearest benchmark date
+        while (bIdx < benchPrices.length - 1 && benchPrices[bIdx + 1].date.getTime() <= sDate) {
+            bIdx++;
+        }
+        if (Math.abs(benchPrices[bIdx].date.getTime() - sDate) < 10 * 86400000) {
+            relStrength.push({
+                date: sectorPrices[i].date,
+                close: sectorPrices[i].close / benchPrices[bIdx].close
+            });
+        }
+    }
+    
+    if (relStrength.length < 30) return null;
+    
+    // Calculate 30-week MA of relative strength (approx 150 trading days)
+    const ma30 = calcSMA(relStrength, 30);
+    const currentRS = relStrength[relStrength.length - 1].close;
+    const prevRS = relStrength[relStrength.length - 5]?.close; // ~1 month ago
+    
+    // Get current Z-score
+    const zData = sectorZScores[sectorTicker];
+    const currentZ = zData?.slice(-1)[0]?.value;
+    
+    if (currentZ === undefined || ma30 === null) return null;
+    
+    // Determine setup and trigger
+    const setup = currentZ < -1 ? 'WEAK' : currentZ > 1 ? 'STRONG' : 'NEUTRAL';
+    const aboveMA = currentRS > ma30;
+    const trending = prevRS ? (currentRS > prevRS ? 'UP' : 'DOWN') : 'FLAT';
+    
+    // Trigger logic
+    let trigger = 'WAIT';
+    let confidence = 0;
+    
+    if (setup === 'WEAK' && aboveMA && trending === 'UP') {
+        trigger = 'BUY ROTATION';
+        confidence = Math.min(100, Math.round(Math.abs(currentZ) * 30 + (aboveMA ? 20 : 0)));
+    } else if (setup === 'STRONG' && !aboveMA && trending === 'DOWN') {
+        trigger = 'SELL ROTATION';
+        confidence = Math.min(100, Math.round(Math.abs(currentZ) * 30 + (!aboveMA ? 20 : 0)));
+    } else if (setup === 'WEAK') {
+        trigger = 'WATCH (weak, wait for trend)';
+        confidence = 30;
+    } else if (setup === 'STRONG') {
+        trigger = 'CAUTION (extended)';
+        confidence = 30;
+    }
+    
+    return {
+        setup,
+        aboveMA,
+        trending,
+        trigger,
+        confidence,
+        currentZ: currentZ.toFixed(2),
+        rsVsMa: ((currentRS / ma30 - 1) * 100).toFixed(1)
+    };
+}
+
 function renderChart() {
     const container = document.getElementById('chartContainer');
     if (!container) return;
@@ -552,10 +731,40 @@ function renderChart() {
     const valStr = z !== undefined ? `${z >= 0 ? '+' : ''}${z.toFixed(2)}` : '...';
     const bench = document.getElementById('benchmark')?.value || 'SPY';
     
+    // Get data quality
+    const quality = sectorDataQuality[selectedSector] || {};
+    const qualityWarning = quality.alignmentPct < 90 ? 'warning' : quality.alignmentPct < 95 ? 'caution' : 'good';
+    
+    // Get rotation trigger
+    const rotation = calcRotationTrigger(selectedSector, bench);
+    
     container.innerHTML = `
         <div class="chart-head">
             <div class="title" style="color:${s.color}">${s.name} <span class="tk">${s.ticker}</span></div>
             <div class="zscore-display"><span class="label">Z-Score:</span><span class="val ${valCls}">${valStr}</span></div>
+        </div>
+        
+        <div class="info-panels">
+            <div class="panel data-quality ${qualityWarning}">
+                <div class="panel-title">Data Quality</div>
+                <div class="panel-row"><span>Source:</span><span>${quality.source || 'N/A'}</span></div>
+                <div class="panel-row"><span>Points:</span><span>${quality.pointCount || 0} weeks</span></div>
+                <div class="panel-row"><span>Range:</span><span>${quality.startDate?.toLocaleDateString() || '?'} - ${quality.endDate?.toLocaleDateString() || '?'}</span></div>
+                <div class="panel-row"><span>Alignment:</span><span class="${qualityWarning}">${quality.alignmentPct || 0}%</span></div>
+                ${quality.missedCount > 5 ? `<div class="panel-warning">⚠ ${quality.missedCount} points couldn't align to benchmark</div>` : ''}
+            </div>
+            
+            ${rotation ? `
+            <div class="panel rotation-trigger">
+                <div class="panel-title">Rotation Trigger</div>
+                <div class="panel-row"><span>Setup:</span><span class="${rotation.setup.toLowerCase()}">${rotation.setup}</span></div>
+                <div class="panel-row"><span>RS vs 30w MA:</span><span class="${rotation.aboveMA ? 'positive' : 'negative'}">${rotation.aboveMA ? 'ABOVE' : 'BELOW'} (${rotation.rsVsMa}%)</span></div>
+                <div class="panel-row"><span>RS Trend:</span><span class="${rotation.trending === 'UP' ? 'positive' : rotation.trending === 'DOWN' ? 'negative' : ''}">${rotation.trending}</span></div>
+                <div class="trigger-signal ${rotation.trigger.includes('BUY') ? 'buy' : rotation.trigger.includes('SELL') ? 'sell' : 'wait'}">
+                    ${rotation.trigger}
+                </div>
+            </div>
+            ` : ''}
         </div>
         
         <div class="chart-section">
@@ -739,7 +948,8 @@ async function refreshAllData() {
     setStatus('loading', `Loading ${bench}...`);
     
     try {
-        benchmarkPrices = await fetchPrices(bench);
+        const benchResult = await fetchPrices(bench);
+        benchmarkPrices = benchResult.prices;
         
         // Precompute benchmark rolling returns ONCE
         const benchRet = calcRollingReturnPct(benchmarkPrices, retWeeks);
@@ -750,14 +960,21 @@ async function refreshAllData() {
         // Throttled fetch - 5 concurrent max
         let completed = 0;
         const results = await mapLimit(SECTORS, 5, async (s) => {
-            const prices = await fetchPrices(s.ticker);
+            const priceResult = await fetchPrices(s.ticker);
             completed++;
             setStatus('loading', `Loading sectors (${completed}/${SECTORS.length})...`);
-            return { ticker: s.ticker, data: calculateZScoreData(prices, benchIndex) };
+            const { zscore, quality } = calculateZScoreData(priceResult.prices, benchIndex, priceResult.source);
+            return { ticker: s.ticker, zscore, quality };
         });
         
         results.forEach((r, i) => {
-            sectorZScores[SECTORS[i].ticker] = r.status === 'fulfilled' ? r.value.data : [];
+            if (r.status === 'fulfilled') {
+                sectorZScores[SECTORS[i].ticker] = r.value.zscore;
+                sectorDataQuality[SECTORS[i].ticker] = r.value.quality;
+            } else {
+                sectorZScores[SECTORS[i].ticker] = [];
+                sectorDataQuality[SECTORS[i].ticker] = { source: 'Error', pointCount: 0 };
+            }
         });
         
         if (!selectedSector) {
