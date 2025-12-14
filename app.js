@@ -551,7 +551,7 @@ async function fetchYahooQuotes(symbols) {
     }
 }
 
-async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
+async function calculateCoMoveScore(symbol, sectorIndex) {
     try {
         const { prices } = await fetchPrices(symbol);
         const stockReturns = calcWeeklyReturns(prices.slice(-110));
@@ -563,23 +563,23 @@ async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
             pairs.push({ stock: r.value, sector: sv });
         }
 
-        if (pairs.length < 8 || sectorStats.std < 1e-6 || sectorStats.variance < 1e-6) return null;
+        if (pairs.length < 8) return null;
 
         const stockVals = pairs.map(p => p.stock);
         const sectorVals = pairs.map(p => p.sector);
         const stockStats = calcReturnStats(stockVals);
-        const sectorMean = sectorVals.reduce((a, b) => a + b, 0) / sectorVals.length;
+        const pairedSectorStats = calcReturnStats(sectorVals);
 
-        if (stockStats.std < 1e-6) return null;
+        if (stockStats.std < 1e-6 || pairedSectorStats.std < 1e-6) return null;
 
         let cov = 0;
         for (let i = 0; i < pairs.length; i++) {
-            cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - sectorMean);
+            cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - pairedSectorStats.mean);
         }
         cov /= Math.max(1, pairs.length - 1);
 
-        const corr = cov / (stockStats.std * sectorStats.std);
-        const beta = cov / sectorStats.variance;
+        const corr = cov / (stockStats.std * pairedSectorStats.std);
+        const beta = cov / pairedSectorStats.variance;
 
         if (!isFinite(corr) || !isFinite(beta) || corr <= 0 || beta <= 0) return null;
 
@@ -650,13 +650,12 @@ async function fetchHoldingsData(sectorTicker) {
     try {
         const sectorPriceData = await fetchPrices(sectorTicker);
         const sectorReturns = calcWeeklyReturns(sectorPriceData.prices.slice(-110));
-        const sectorStats = calcReturnStats(sectorReturns.map(r => r.value));
 
-        if (sectorStats.count >= 10 && sectorStats.variance > 1e-6) {
+        if (sectorReturns.length >= 10) {
             const sectorIndex = buildReturnIndex(sectorReturns);
             const scored = await mapLimit(results.slice(0, 15), 3, async r => ({
                 ...r,
-                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex, sectorStats)
+                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex)
             }));
 
             const scoredResults = scored
