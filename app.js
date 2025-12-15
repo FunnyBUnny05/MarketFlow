@@ -25,7 +25,8 @@ const SECTORS = [
 
 const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1';
 const FINNHUB_API_KEY_STORAGE_KEY = 'finnhubApiKey';
-let FINNHUB_API_KEY = localStorage.getItem(FINNHUB_API_KEY_STORAGE_KEY) || '';
+const DEFAULT_FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
+let FINNHUB_API_KEY = localStorage.getItem(FINNHUB_API_KEY_STORAGE_KEY) || DEFAULT_FINNHUB_API_KEY;
 
 let selectedSector = null;
 let sectorZScores = {};
