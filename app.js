@@ -34,13 +34,32 @@ const FINNHUB_API_KEY_STORAGE_KEY = 'finnhubApiKey';
 const DEFAULT_FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
 let FINNHUB_API_KEY = localStorage.getItem(FINNHUB_API_KEY_STORAGE_KEY) || DEFAULT_FINNHUB_API_KEY;
 
+// Growth Score Configuration
+const GROWTH_SCORE_CONFIG = {
+    maxHoldings: 50, // Max holdings to analyze
+    weights: {
+        ret12m: 0.20,
+        ret6m: 0.15,
+        ret3m: 0.10,
+        maxDrawdown: 0.10,
+        coMoveScore: 0.15,
+        trend30w: 0.05,
+        rsTrend: 0.05,
+        sentimentScore: 0.10,
+        newsCount: 0.10
+    },
+    cycleBoostFactor: 0.15
+};
+
 let selectedSector = null;
 let sectorZScores = {};
 let sectorDataQuality = {}; // Track data quality per sector
 let benchmarkPrices = null;
 let isLoading = false;
+let currentHoldingsSort = 'score'; // Default sort by Growth Score
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const NEWS_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours for news
 const _cache = new Map();
 
 // Load cache - store dates as ISO strings
@@ -601,6 +620,306 @@ async function fetchFinnhubQuote(symbol) {
     return quote;
 }
 
+// ============ NEWS & SENTIMENT (FINNHUB) ============
+
+async function fetchCompanyNews(symbol) {
+    const cacheKey = `news:${symbol}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < NEWS_CACHE_TTL_MS) return hit.data;
+
+    try {
+        const to = new Date();
+        const from = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+        const data = await fetchFromFinnhub('/company-news', {
+            symbol,
+            from: from.toISOString().split('T')[0],
+            to: to.toISOString().split('T')[0]
+        });
+
+        const result = {
+            newsCount: Array.isArray(data) ? data.length : 0,
+            hasData: true
+        };
+
+        _cache.set(cacheKey, { ts: Date.now(), data: result });
+        return result;
+    } catch (e) {
+        console.log(`News fetch failed for ${symbol}:`, e.message);
+        return { newsCount: null, hasData: false };
+    }
+}
+
+async function fetchNewsSentiment(symbol) {
+    const cacheKey = `sentiment:${symbol}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < NEWS_CACHE_TTL_MS) return hit.data;
+
+    try {
+        const data = await fetchFromFinnhub('/news-sentiment', { symbol });
+
+        // Finnhub returns sentiment with companyNewsScore, sectorAverageBullishPercent, etc.
+        const result = {
+            sentimentScore: data?.companyNewsScore ?? data?.sentiment?.bullishPercent ?? null,
+            buzz: data?.buzz?.buzz ?? null,
+            hasData: data?.companyNewsScore != null || data?.sentiment != null
+        };
+
+        _cache.set(cacheKey, { ts: Date.now(), data: result });
+        return result;
+    } catch (e) {
+        // Sentiment endpoint may be premium-only
+        console.log(`Sentiment fetch failed for ${symbol}:`, e.message);
+        return { sentimentScore: null, buzz: null, hasData: false };
+    }
+}
+
+// ============ TECHNICAL METRICS CALCULATION ============
+
+function calcReturn(prices, weeks) {
+    if (!prices || prices.length < weeks + 1) return null;
+    const recent = prices[prices.length - 1]?.close;
+    const past = prices[prices.length - 1 - weeks]?.close;
+    if (!recent || !past || past <= 0) return null;
+    return ((recent / past) - 1) * 100;
+}
+
+function calcMaxDrawdown(prices, weeks) {
+    if (!prices || prices.length < weeks) return null;
+    const slice = prices.slice(-weeks);
+    let peak = slice[0]?.close || 0;
+    let maxDD = 0;
+
+    for (const p of slice) {
+        if (p.close > peak) peak = p.close;
+        const dd = ((p.close - peak) / peak) * 100;
+        if (dd < maxDD) maxDD = dd;
+    }
+    return maxDD; // Negative number
+}
+
+function calcSMAValue(prices, period) {
+    if (!prices || prices.length < period) return null;
+    const slice = prices.slice(-period);
+    return slice.reduce((a, b) => a + b.close, 0) / period;
+}
+
+function calcRSTrend(stockPrices, sectorPrices, weeks = 8) {
+    if (!stockPrices || !sectorPrices || stockPrices.length < weeks || sectorPrices.length < weeks) return null;
+
+    // Calculate RS ratio for last 'weeks' weeks
+    const rsValues = [];
+    const stockSlice = stockPrices.slice(-weeks);
+
+    for (let i = 0; i < stockSlice.length; i++) {
+        const stockDate = stockSlice[i].date.getTime();
+        // Find nearest sector price
+        let nearestSector = null;
+        let minDist = Infinity;
+        for (const sp of sectorPrices.slice(-weeks * 2)) {
+            const dist = Math.abs(sp.date.getTime() - stockDate);
+            if (dist < minDist) {
+                minDist = dist;
+                nearestSector = sp;
+            }
+        }
+        if (nearestSector && minDist < 10 * 86400000) { // Within 10 days
+            rsValues.push(stockSlice[i].close / nearestSector.close);
+        }
+    }
+
+    if (rsValues.length < 4) return null;
+
+    // Simple slope calculation (is RS improving?)
+    const firstHalf = rsValues.slice(0, Math.floor(rsValues.length / 2));
+    const secondHalf = rsValues.slice(Math.floor(rsValues.length / 2));
+    const firstAvg = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
+    const secondAvg = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
+
+    return secondAvg > firstAvg; // true if improving
+}
+
+async function calcTechnicalMetrics(symbol, sectorPrices) {
+    try {
+        const { prices } = await fetchStockPrices(symbol);
+        if (!prices || prices.length < 52) {
+            return { hasData: false };
+        }
+
+        const ret12m = calcReturn(prices, 52);
+        const ret6m = calcReturn(prices, 26);
+        const ret3m = calcReturn(prices, 13);
+        const maxDrawdown = calcMaxDrawdown(prices, 52);
+        const sma30w = calcSMAValue(prices, 30);
+        const currentPrice = prices[prices.length - 1]?.close;
+        const trend30w = sma30w && currentPrice ? currentPrice > sma30w : null;
+        const rsTrend = calcRSTrend(prices, sectorPrices, 8);
+
+        return {
+            ret12m,
+            ret6m,
+            ret3m,
+            maxDrawdown,
+            trend30w,
+            rsTrend,
+            prices, // Keep for coMove calculation
+            hasData: true
+        };
+    } catch (e) {
+        console.log(`Technical metrics failed for ${symbol}:`, e.message);
+        return { hasData: false };
+    }
+}
+
+// ============ SECTOR TURN DETECTION ============
+
+function detectSectorTurn(sectorTicker, benchTicker) {
+    const zData = sectorZScores[sectorTicker];
+    if (!zData || zData.length < 6) return false;
+
+    const currentZ = zData[zData.length - 1]?.value;
+    if (currentZ === undefined) return false;
+
+    // Check if Z-score was below -2 in last 6 months (approx 6 data points for monthly)
+    const last6Months = zData.slice(-6);
+    const wasBelow2 = last6Months.some(d => d.value < -2);
+    const nowAboveMinus1 = currentZ > -1;
+
+    if (!wasBelow2 || !nowAboveMinus1) return false;
+
+    // Check RS vs 30-week MA
+    const sCache = _cache.get(getPriceCacheKey(sectorTicker));
+    const bCache = _cache.get(getPriceCacheKey(benchTicker));
+
+    if (!sCache?.data || !bCache?.data) return false;
+
+    const sectorPrices = sCache.data;
+    const benchPrices = bCache.data;
+
+    // Calculate relative strength
+    const relStrength = [];
+    let bIdx = 0;
+    for (let i = 0; i < sectorPrices.length; i++) {
+        const sDate = sectorPrices[i].date.getTime();
+        while (bIdx < benchPrices.length - 1 && benchPrices[bIdx + 1].date.getTime() <= sDate) {
+            bIdx++;
+        }
+        if (Math.abs(benchPrices[bIdx].date.getTime() - sDate) < 10 * 86400000) {
+            relStrength.push({
+                date: sectorPrices[i].date,
+                close: sectorPrices[i].close / benchPrices[bIdx].close
+            });
+        }
+    }
+
+    if (relStrength.length < 30) return false;
+
+    const ma30 = calcSMA(relStrength, 30);
+    const currentRS = relStrength[relStrength.length - 1].close;
+
+    return ma30 && currentRS > ma30;
+}
+
+// ============ PERCENTILE & SCORING ============
+
+function calcPercentileRank(value, allValues) {
+    if (value == null || !allValues.length) return null;
+    const validValues = allValues.filter(v => v != null);
+    if (!validValues.length) return null;
+    const below = validValues.filter(v => v < value).length;
+    return (below / validValues.length) * 100;
+}
+
+function calcGrowthScore(metrics, allHoldingsMetrics, sectorTurn) {
+    const weights = GROWTH_SCORE_CONFIG.weights;
+    let totalWeight = 0;
+    let weightedSum = 0;
+
+    // Collect all values for percentile calculation
+    const allRet12m = allHoldingsMetrics.map(m => m.ret12m).filter(v => v != null);
+    const allRet6m = allHoldingsMetrics.map(m => m.ret6m).filter(v => v != null);
+    const allRet3m = allHoldingsMetrics.map(m => m.ret3m).filter(v => v != null);
+    const allMaxDD = allHoldingsMetrics.map(m => m.maxDrawdown).filter(v => v != null);
+    const allCoMove = allHoldingsMetrics.map(m => m.coMoveScore).filter(v => v != null);
+    const allSentiment = allHoldingsMetrics.map(m => m.sentimentScore).filter(v => v != null);
+    const allNews = allHoldingsMetrics.map(m => m.newsCount).filter(v => v != null);
+
+    const percentiles = {};
+
+    // Technical returns (higher is better)
+    if (metrics.ret12m != null) {
+        percentiles.ret12m = calcPercentileRank(metrics.ret12m, allRet12m);
+        weightedSum += percentiles.ret12m * weights.ret12m;
+        totalWeight += weights.ret12m;
+    }
+    if (metrics.ret6m != null) {
+        percentiles.ret6m = calcPercentileRank(metrics.ret6m, allRet6m);
+        weightedSum += percentiles.ret6m * weights.ret6m;
+        totalWeight += weights.ret6m;
+    }
+    if (metrics.ret3m != null) {
+        percentiles.ret3m = calcPercentileRank(metrics.ret3m, allRet3m);
+        weightedSum += percentiles.ret3m * weights.ret3m;
+        totalWeight += weights.ret3m;
+    }
+
+    // Max drawdown (less negative is better, so invert percentile)
+    if (metrics.maxDrawdown != null) {
+        percentiles.maxDrawdown = 100 - calcPercentileRank(Math.abs(metrics.maxDrawdown), allMaxDD.map(Math.abs));
+        weightedSum += percentiles.maxDrawdown * weights.maxDrawdown;
+        totalWeight += weights.maxDrawdown;
+    }
+
+    // CoMove score (higher is better)
+    if (metrics.coMoveScore != null) {
+        percentiles.coMoveScore = calcPercentileRank(metrics.coMoveScore, allCoMove);
+        weightedSum += percentiles.coMoveScore * weights.coMoveScore;
+        totalWeight += weights.coMoveScore;
+    }
+
+    // Trend (binary)
+    if (metrics.trend30w != null) {
+        const trendScore = metrics.trend30w ? 100 : 0;
+        weightedSum += trendScore * weights.trend30w;
+        totalWeight += weights.trend30w;
+    }
+
+    // RS Trend (binary)
+    if (metrics.rsTrend != null) {
+        const rsScore = metrics.rsTrend ? 100 : 0;
+        weightedSum += rsScore * weights.rsTrend;
+        totalWeight += weights.rsTrend;
+    }
+
+    // Sentiment (higher is better)
+    if (metrics.sentimentScore != null) {
+        percentiles.sentimentScore = calcPercentileRank(metrics.sentimentScore, allSentiment);
+        weightedSum += percentiles.sentimentScore * weights.sentimentScore;
+        totalWeight += weights.sentimentScore;
+    }
+
+    // News count (higher attention is better)
+    if (metrics.newsCount != null) {
+        percentiles.newsCount = calcPercentileRank(metrics.newsCount, allNews);
+        weightedSum += percentiles.newsCount * weights.newsCount;
+        totalWeight += weights.newsCount;
+    }
+
+    // Calculate base score (re-normalized to 100)
+    let score = totalWeight > 0 ? (weightedSum / totalWeight) : 0;
+
+    // Apply cycle-end boost
+    if (sectorTurn && percentiles.coMoveScore != null) {
+        const boostMultiplier = 1 + (GROWTH_SCORE_CONFIG.cycleBoostFactor * (percentiles.coMoveScore / 100));
+        score = Math.min(100, score * boostMultiplier);
+    }
+
+    return {
+        score: Math.round(score * 10) / 10,
+        percentiles,
+        sectorTurn
+    };
+}
+
 async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
     try {
         const { prices } = await fetchStockPrices(symbol);
@@ -650,62 +969,155 @@ async function fetchHoldingsData(sectorTicker) {
     if (!SSGA_ETFS.has(sectorTicker)) return [];
 
     const holdings = await fetchSSGAHoldings(sectorTicker);
-
     if (!holdings.length) return [];
 
-    const quoteResults = await mapLimit(holdings.slice(0, 50), 5, async (h) => ({
-        ...h,
-        ...(await fetchFinnhubQuote(h.ticker))
-    }));
+    const bench = document.getElementById('benchmark')?.value || 'SPY';
+    const sectorTurn = detectSectorTurn(sectorTicker, bench);
+
+    // Get sector price data for calculations
+    let sectorPrices = null;
+    let sectorIndex = null;
+    let sectorStats = null;
+
+    try {
+        const sectorPriceData = await fetchPrices(sectorTicker);
+        sectorPrices = sectorPriceData.prices;
+        const sectorReturns = calcWeeklyReturns(sectorPrices.slice(-110));
+        sectorStats = calcReturnStats(sectorReturns.map(r => r.value));
+        if (sectorStats.count >= 10 && sectorStats.variance > 1e-6) {
+            sectorIndex = buildReturnIndex(sectorReturns);
+        }
+    } catch (e) {
+        console.log('Sector price fetch failed:', e.message);
+    }
+
+    const maxHoldings = GROWTH_SCORE_CONFIG.maxHoldings;
+    const topHoldings = holdings.slice(0, maxHoldings);
+
+    // Phase 1: Fetch quotes (fast, 5 concurrent)
+    const quoteResults = await mapLimit(topHoldings, 5, async (h) => {
+        try {
+            const quote = await fetchFinnhubQuote(h.ticker);
+            return { ...h, ...quote };
+        } catch (e) {
+            return { ...h, price: 0, change: 0 };
+        }
+    });
 
     let results = quoteResults
         .filter(r => r.status === 'fulfilled' && r.value)
-        .map(r => ({
-            symbol: r.value.symbol,
-            name: (r.value.name || r.value.symbol || '').substring(0, 28) || r.value.symbol,
-            price: r.value.price,
-            change: r.value.change,
-            volume: r.value.volume,
-            weight: r.value.weight || 0
-        }));
+        .map(r => r.value);
 
-    // Sort by weight, fallback to volume when weights are missing
-    results.sort((a, b) => {
-        if (a.weight === b.weight) return (b.volume || 0) - (a.volume || 0);
-        return (b.weight || 0) - (a.weight || 0);
-    });
-
-    // Calculate which holdings move most with the sector (beta * correlation)
-    try {
-        const sectorPriceData = await fetchPrices(sectorTicker);
-        const sectorReturns = calcWeeklyReturns(sectorPriceData.prices.slice(-110));
-        const sectorStats = calcReturnStats(sectorReturns.map(r => r.value));
-
-        if (sectorStats.count >= 10 && sectorStats.variance > 1e-6) {
-            const sectorIndex = buildReturnIndex(sectorReturns);
-            const scored = await mapLimit(results.slice(0, 15), 3, async r => ({
-                ...r,
-                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex, sectorStats)
-            }));
-
-            const scoredValues = scored
-                .filter(s => s.status === 'fulfilled' && s.value)
-                .map(s => s.value);
-
-            if (scoredValues.some(s => s.coMoveScore != null)) {
-                results = scoredValues.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
+    // Phase 2: Fetch technical metrics (slower, 3 concurrent)
+    const technicalResults = await mapLimit(results.slice(0, 25), 3, async (h) => {
+        const tech = await calcTechnicalMetrics(h.ticker, sectorPrices);
+        let coMoveScore = null;
+        if (tech.prices && sectorIndex && sectorStats) {
+            const stockReturns = calcWeeklyReturns(tech.prices.slice(-110));
+            const pairs = [];
+            for (const r of stockReturns) {
+                const sv = nearestValue(sectorIndex, r.date.getTime(), 7);
+                if (sv != null) pairs.push({ stock: r.value, sector: sv });
+            }
+            if (pairs.length >= 8) {
+                const stockVals = pairs.map(p => p.stock);
+                const sectorVals = pairs.map(p => p.sector);
+                const stockStats = calcReturnStats(stockVals);
+                const sectorMean = sectorVals.reduce((a, b) => a + b, 0) / sectorVals.length;
+                if (stockStats.std > 1e-6) {
+                    let cov = 0;
+                    for (let i = 0; i < pairs.length; i++) {
+                        cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - sectorMean);
+                    }
+                    cov /= Math.max(1, pairs.length - 1);
+                    const corr = cov / (stockStats.std * sectorStats.std);
+                    const beta = cov / sectorStats.variance;
+                    if (isFinite(corr) && isFinite(beta) && corr > 0 && beta > 0) {
+                        coMoveScore = corr * beta;
+                    }
+                }
             }
         }
-    } catch (e) {
-        console.log('Co-move scoring skipped:', e.message);
-    }
+        return { ...h, ...tech, coMoveScore };
+    });
 
-    results = results.slice(0, 10);
+    results = technicalResults
+        .filter(r => r.status === 'fulfilled' && r.value)
+        .map(r => r.value);
+
+    // Phase 3: Fetch news/sentiment (3 concurrent)
+    const newsResults = await mapLimit(results, 3, async (h) => {
+        const [news, sentiment] = await Promise.all([
+            fetchCompanyNews(h.symbol || h.ticker),
+            fetchNewsSentiment(h.symbol || h.ticker)
+        ]);
+        return {
+            ...h,
+            newsCount: news.newsCount,
+            newsHasData: news.hasData,
+            sentimentScore: sentiment.sentimentScore,
+            sentimentHasData: sentiment.hasData
+        };
+    });
+
+    results = newsResults
+        .filter(r => r.status === 'fulfilled' && r.value)
+        .map(r => r.value);
+
+    // Phase 4: Calculate Growth Scores
+    const allMetrics = results.map(r => ({
+        ret12m: r.ret12m,
+        ret6m: r.ret6m,
+        ret3m: r.ret3m,
+        maxDrawdown: r.maxDrawdown,
+        coMoveScore: r.coMoveScore,
+        sentimentScore: r.sentimentScore,
+        newsCount: r.newsCount
+    }));
+
+    results = results.map(r => {
+        const scoreData = calcGrowthScore({
+            ret12m: r.ret12m,
+            ret6m: r.ret6m,
+            ret3m: r.ret3m,
+            maxDrawdown: r.maxDrawdown,
+            trend30w: r.trend30w,
+            rsTrend: r.rsTrend,
+            coMoveScore: r.coMoveScore,
+            sentimentScore: r.sentimentScore,
+            newsCount: r.newsCount
+        }, allMetrics, sectorTurn);
+
+        return {
+            symbol: r.symbol || r.ticker,
+            name: (r.name || r.symbol || r.ticker || '').substring(0, 24),
+            price: r.price || 0,
+            change: r.change || 0,
+            weight: r.weight || 0,
+            growthScore: scoreData.score,
+            ret12m: r.ret12m,
+            ret6m: r.ret6m,
+            ret3m: r.ret3m,
+            maxDrawdown: r.maxDrawdown,
+            trend30w: r.trend30w,
+            rsTrend: r.rsTrend,
+            coMoveScore: r.coMoveScore,
+            newsCount: r.newsCount,
+            newsHasData: r.newsHasData,
+            sentimentScore: r.sentimentScore,
+            sentimentHasData: r.sentimentHasData,
+            sectorTurn,
+            percentiles: scoreData.percentiles
+        };
+    });
+
+    // Default sort by Growth Score
+    results.sort((a, b) => (b.growthScore ?? 0) - (a.growthScore ?? 0));
 
     if (results.length > 0) {
         _cache.set(cacheKey, { ts: Date.now(), data: results });
     }
-    
+
     return results;
 }
 
@@ -1036,51 +1448,124 @@ function createPriceChart(ticker, color, bench) {
     });
 }
 
+function sortHoldings(holdings, sortBy) {
+    const sorted = [...holdings];
+    switch (sortBy) {
+        case 'score':
+            sorted.sort((a, b) => (b.growthScore ?? 0) - (a.growthScore ?? 0));
+            break;
+        case 'weight':
+            sorted.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+            break;
+        case 'comove':
+            sorted.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
+            break;
+        case 'ret12m':
+            sorted.sort((a, b) => (b.ret12m ?? -Infinity) - (a.ret12m ?? -Infinity));
+            break;
+        default:
+            sorted.sort((a, b) => (b.growthScore ?? 0) - (a.growthScore ?? 0));
+    }
+    return sorted;
+}
+
+function changeHoldingsSort(sortBy) {
+    currentHoldingsSort = sortBy;
+    if (selectedSector) {
+        loadHoldings(selectedSector);
+    }
+}
+
 async function loadHoldings(sectorTicker) {
     const container = document.getElementById('holdingsTable');
     if (!container) return;
-    
+
     try {
-        const holdings = await fetchHoldingsData(sectorTicker);
-        
+        let holdings = await fetchHoldingsData(sectorTicker);
+
         if (!holdings.length) {
             container.innerHTML = '<div class="holdings-empty">No holdings data available</div>';
             return;
         }
 
-        // Check if we have weight data
-        const hasWeights = holdings[0].weight > 0;
-        const hasScores = holdings.some(h => h.coMoveScore != null);
+        // Sort holdings based on current selection
+        holdings = sortHoldings(holdings, currentHoldingsSort);
+
+        // Check for sector turn
+        const sectorTurn = holdings[0]?.sectorTurn || false;
 
         container.innerHTML = `
-            <table class="holdings">
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Symbol</th>
-                        <th>Name</th>
-                        <th>Price</th>
-                        <th>Change</th>
-                        ${hasScores ? '<th>Co-Move</th>' : ''}
-                        <th>${hasWeights ? 'Weight' : 'Volume'}</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${holdings.map((h, i) => `
+            <div class="holdings-header">
+                <div class="holdings-controls">
+                    <label>Sort by:</label>
+                    <select id="holdingsSort" onchange="changeHoldingsSort(this.value)">
+                        <option value="score" ${currentHoldingsSort === 'score' ? 'selected' : ''}>Score</option>
+                        <option value="weight" ${currentHoldingsSort === 'weight' ? 'selected' : ''}>Weight</option>
+                        <option value="comove" ${currentHoldingsSort === 'comove' ? 'selected' : ''}>CoMove</option>
+                        <option value="ret12m" ${currentHoldingsSort === 'ret12m' ? 'selected' : ''}>12M%</option>
+                    </select>
+                    ${sectorTurn ? '<span class="sector-turn-badge">🔄 Cycle Turn Active</span>' : ''}
+                </div>
+            </div>
+            <div class="holdings-table-wrap">
+                <table class="holdings growth-table">
+                    <thead>
                         <tr>
-                            <td class="rank">${i + 1}</td>
-                            <td class="symbol">${h.symbol}</td>
-                            <td class="name">${h.name}</td>
-                            <td class="price">$${h.price.toFixed(2)}</td>
-                            <td class="change ${h.change >= 0 ? 'positive' : 'negative'}">${h.change >= 0 ? '+' : ''}${h.change.toFixed(2)}%</td>
-                            ${hasScores ? `<td class="volume">${h.coMoveScore != null ? h.coMoveScore.toFixed(2) : '-'}</td>` : ''}
-                            <td class="volume">${hasWeights ? h.weight.toFixed(2) + '%' : formatVolume(h.volume)}</td>
+                            <th>#</th>
+                            <th>Symbol</th>
+                            <th title="Growth Potential Score (0-100)">Score</th>
+                            <th title="12-Month Return">12M%</th>
+                            <th title="Max Drawdown (12M)">DD</th>
+                            <th title="News articles (30d)">News</th>
+                            <th title="Sentiment Score">Sent</th>
+                            <th title="Correlation * Beta with sector">CoMove</th>
+                            <th title="ETF Weight">Wt%</th>
                         </tr>
-                    `).join('')}
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        ${holdings.slice(0, 15).map((h, i) => `
+                            <tr class="${h.sectorTurn && h.coMoveScore > 0.5 ? 'cycle-boost' : ''}">
+                                <td class="rank">${i + 1}</td>
+                                <td class="symbol" title="${h.name}">${h.symbol}</td>
+                                <td class="score">
+                                    <span class="score-value ${h.growthScore >= 70 ? 'high' : h.growthScore >= 40 ? 'medium' : 'low'}">
+                                        ${h.growthScore != null ? h.growthScore.toFixed(1) : '-'}
+                                    </span>
+                                </td>
+                                <td class="ret ${(h.ret12m ?? 0) >= 0 ? 'positive' : 'negative'}">
+                                    ${h.ret12m != null ? `${h.ret12m >= 0 ? '+' : ''}${h.ret12m.toFixed(1)}%` : '<span class="data-gap">Gap</span>'}
+                                </td>
+                                <td class="dd ${(h.maxDrawdown ?? 0) > -15 ? 'good' : 'bad'}">
+                                    ${h.maxDrawdown != null ? `${h.maxDrawdown.toFixed(1)}%` : '<span class="data-gap">Gap</span>'}
+                                </td>
+                                <td class="news">
+                                    ${h.newsHasData ? (h.newsCount ?? 0) : '<span class="data-gap">Gap</span>'}
+                                </td>
+                                <td class="sentiment">
+                                    ${h.sentimentHasData && h.sentimentScore != null
+                                        ? `<span class="${h.sentimentScore > 0.5 ? 'positive' : h.sentimentScore < 0.3 ? 'negative' : ''}">${(h.sentimentScore * 100).toFixed(0)}</span>`
+                                        : '<span class="data-gap">Gap</span>'}
+                                </td>
+                                <td class="comove">
+                                    ${h.coMoveScore != null ? h.coMoveScore.toFixed(2) : '<span class="data-gap">Gap</span>'}
+                                </td>
+                                <td class="weight">${h.weight.toFixed(2)}%</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+            <div class="score-legend">
+                <div class="legend-title">Score Breakdown:</div>
+                <div class="legend-items">
+                    <span>Technical (55%): 12M/6M/3M returns + Drawdown</span>
+                    <span>Trend (25%): CoMove + Price>30wMA + RS improving</span>
+                    <span>Sentiment (20%): News count + Sentiment score</span>
+                </div>
+            </div>
         `;
     } catch (e) {
+        console.error('Holdings load error:', e);
         container.innerHTML = '<div class="holdings-empty">Failed to load holdings</div>';
     }
 }

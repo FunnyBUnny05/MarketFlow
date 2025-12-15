@@ -346,6 +346,131 @@
             .sector-list { width: 100%; max-height: 300px; border-left: none; border-top: 1px solid #1a1a2e; }
             .chart-area { min-height: 500px; }
         }
+
+        /* Growth Score Holdings Table */
+        .holdings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 6px;
+        }
+        .holdings-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .holdings-controls label {
+            color: #888;
+            font-size: 0.8rem;
+        }
+        .holdings-controls select {
+            background: #1a1a2e;
+            color: #fff;
+            border: 1px solid #333;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+        }
+        .sector-turn-badge {
+            background: linear-gradient(135deg, #22c55e33, #10b98133);
+            color: #22c55e;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border: 1px solid #22c55e44;
+        }
+        .holdings-table-wrap {
+            overflow-x: auto;
+        }
+        .growth-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }
+        .growth-table th {
+            background: #1a1a2e;
+            color: #888;
+            padding: 8px 6px;
+            text-align: left;
+            font-weight: 500;
+            border-bottom: 1px solid #333;
+            white-space: nowrap;
+        }
+        .growth-table td {
+            padding: 8px 6px;
+            border-bottom: 1px solid #1a1a2e;
+            white-space: nowrap;
+        }
+        .growth-table tr:hover {
+            background: rgba(255,255,255,0.03);
+        }
+        .growth-table tr.cycle-boost {
+            background: rgba(34, 197, 94, 0.08);
+        }
+        .growth-table .rank {
+            color: #555;
+            width: 30px;
+        }
+        .growth-table .symbol {
+            font-weight: 600;
+            color: #fff;
+        }
+        .growth-table .score-value {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+        }
+        .growth-table .score-value.high {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+        }
+        .growth-table .score-value.medium {
+            background: rgba(245, 158, 11, 0.2);
+            color: #f59e0b;
+        }
+        .growth-table .score-value.low {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        .growth-table .positive { color: #22c55e; }
+        .growth-table .negative { color: #ef4444; }
+        .growth-table .dd.good { color: #22c55e; }
+        .growth-table .dd.bad { color: #ef4444; }
+        .growth-table .data-gap {
+            color: #555;
+            font-style: italic;
+            font-size: 0.7rem;
+        }
+        .growth-table .weight {
+            color: #888;
+        }
+        .score-legend {
+            margin-top: 12px;
+            padding: 10px;
+            background: rgba(255,255,255,0.02);
+            border-radius: 6px;
+            font-size: 0.7rem;
+            color: #666;
+        }
+        .score-legend .legend-title {
+            color: #888;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .score-legend .legend-items {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .score-legend .legend-items span {
+            display: inline-flex;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
