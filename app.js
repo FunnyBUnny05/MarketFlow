@@ -1,9 +1,6 @@
 // Sector Z-Score Dashboard v5 - Fixed
 // Proper fetch handling, throttled concurrency, real ETF holdings
 
-// Finnhub API configuration
-const FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
-
 const SECTORS = [
     { ticker: 'XLB', name: 'Materials', color: '#f97316' },
     { ticker: 'XLE', name: 'Energy', color: '#3b82f6' },
@@ -26,11 +23,10 @@ const SECTORS = [
     { ticker: 'IYT', name: 'Transportation', color: '#38bdf8' },
 ];
 
-// SSGA ETFs with daily holdings XLSX
-const SSGA_ETFS = new Set([
-    'XLB', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLU', 'XLV', 'XLY', 'XLRE', 'XLC',
-    'XHB', 'XOP', 'XME', 'KRE', 'XBI'
-]);
+const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1';
+const FINNHUB_API_KEY_STORAGE_KEY = 'finnhubApiKey';
+const DEFAULT_FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
+let FINNHUB_API_KEY = localStorage.getItem(FINNHUB_API_KEY_STORAGE_KEY) || DEFAULT_FINNHUB_API_KEY;
 
 let selectedSector = null;
 let sectorZScores = {};
@@ -40,15 +36,6 @@ let isLoading = false;
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const _cache = new Map();
-
-// Circuit breaker state per proxy
-const proxyHealth = {
-    'allorigins': { failures: 0, disabledUntil: 0 },
-    'corsproxy': { failures: 0, disabledUntil: 0 },
-    'codetabs': { failures: 0, disabledUntil: 0 }
-};
-const CIRCUIT_BREAKER_THRESHOLD = 3;
-const CIRCUIT_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 // Load cache - store dates as ISO strings
 try {
@@ -87,149 +74,37 @@ function saveCache() {
 
 // ============ FETCH UTILITIES ============
 
-// Get active proxies (not circuit-broken)
-function getActiveProxies(url) {
-    const now = Date.now();
-    const allProxies = [
-        { name: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
-        { name: 'corsproxy', url: `https://corsproxy.io/?${encodeURIComponent(url)}` },
-        { name: 'codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
-    ];
-    
-    return allProxies.filter(p => {
-        const health = proxyHealth[p.name];
-        if (health.disabledUntil > now) {
-            return false; // Still in cooldown
-        }
-        if (health.failures >= CIRCUIT_BREAKER_THRESHOLD) {
-            // Reset after cooldown
-            health.failures = 0;
-        }
-        return true;
-    });
-}
-
-function recordProxySuccess(proxyName) {
-    if (proxyHealth[proxyName]) {
-        proxyHealth[proxyName].failures = 0;
-        proxyHealth[proxyName].disabledUntil = 0;
-    }
-}
-
-function recordProxyFailure(proxyName) {
-    if (proxyHealth[proxyName]) {
-        proxyHealth[proxyName].failures++;
-        if (proxyHealth[proxyName].failures >= CIRCUIT_BREAKER_THRESHOLD) {
-            proxyHealth[proxyName].disabledUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
-            console.log(`Circuit breaker: ${proxyName} disabled for 10 minutes`);
+function requireFinnhubApiKey() {
+    if (!FINNHUB_API_KEY) {
+        const entered = prompt('Enter Finnhub API key');
+        if (entered) {
+            FINNHUB_API_KEY = entered.trim();
+            localStorage.setItem(FINNHUB_API_KEY_STORAGE_KEY, FINNHUB_API_KEY);
         }
     }
-}
 
-// First-success race that aborts losers with circuit breaker
-async function fetchFirstSuccess(url, timeoutMs = 12000) {
-    const proxies = getActiveProxies(url);
-    
-    if (proxies.length === 0) {
-        // All proxies circuit-broken, reset and try anyway
-        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
-        return fetchFirstSuccess(url, timeoutMs);
+    if (!FINNHUB_API_KEY) {
+        throw new Error('Missing Finnhub API key');
     }
-    
-    const controllers = proxies.map(() => new AbortController());
-    const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
 
-    try {
-        const wrapped = proxies.map((p, i) => (async () => {
-            try {
-                const res = await fetch(p.url, { signal: controllers[i].signal });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const text = await res.text();
-                const t = text.trim();
-                if (!(t.startsWith('{') || t.startsWith('[') || t.startsWith('Date,'))) {
-                    throw new Error('Invalid response');
-                }
-                recordProxySuccess(p.name);
-                return { text, proxyName: p.name };
-            } catch (e) {
-                recordProxyFailure(p.name);
-                throw e;
-            }
-        })());
+    return FINNHUB_API_KEY;
+}
 
-        const result = await new Promise((resolve, reject) => {
-            let pending = wrapped.length, lastErr;
-            wrapped.forEach(p =>
-                p.then(resolve).catch(err => {
-                    lastErr = err;
-                    pending--;
-                    if (pending === 0) reject(lastErr);
-                })
-            );
-        });
-
-        controllers.forEach(c => c.abort()); // Kill losers
-        return result.text;
-    } finally {
-        clearTimeout(timeout);
+async function fetchFromFinnhub(path, params = {}) {
+    const token = requireFinnhubApiKey();
+    const url = `${FINNHUB_BASE_URL}${path}?${new URLSearchParams({ ...params, token })}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+        throw new Error(`Finnhub error ${res.status}`);
     }
-}
-
-async function fetchWithRace(url, timeoutMs = 12000) {
-    return fetchFirstSuccess(url, timeoutMs);
-}
-
-// Binary fetch for XLSX files with circuit breaker
-async function fetchBinaryFirstSuccess(url, timeoutMs = 15000) {
-    const proxies = getActiveProxies(url);
-    
-    if (proxies.length === 0) {
-        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
-        return fetchBinaryFirstSuccess(url, timeoutMs);
+    const data = await res.json();
+    if (data?.error) {
+        throw new Error(data.error);
     }
-    
-    const controllers = proxies.map(() => new AbortController());
-    const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
-
-    try {
-        const result = await new Promise((resolve, reject) => {
-            let pending = proxies.length, lastErr;
-            proxies.forEach((p, i) => {
-                fetch(p.url, { signal: controllers[i].signal })
-                    .then(r => {
-                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                        return r.arrayBuffer();
-                    })
-                    .then(buf => {
-                        const b = new Uint8Array(buf);
-                        // XLSX is ZIP, starts with "PK"
-                        if (b.length < 4 || b[0] !== 0x50 || b[1] !== 0x4B) {
-                            throw new Error('Not XLSX');
-                        }
-                        recordProxySuccess(p.name);
-                        resolve(buf);
-                    })
-                    .catch(err => {
-                        recordProxyFailure(p.name);
-                        lastErr = err;
-                        pending--;
-                        if (pending === 0) reject(lastErr);
-                    });
-            });
-        });
-
-        controllers.forEach(c => c.abort());
-        return result;
-    } finally {
-        clearTimeout(timeout);
-    }
+    return data;
 }
 
-async function fetchWithRaceBinary(url, timeoutMs = 15000) {
-    return fetchBinaryFirstSuccess(url, timeoutMs);
-}
-
-// Throttled parallel execution - prevents proxy overload
+// Throttled parallel execution - prevents overload
 async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
     let idx = 0;
@@ -249,44 +124,41 @@ async function mapLimit(items, limit, fn) {
     return results;
 }
 
-// ============ PRICE DATA FETCHING (Finnhub Only) ============
+// ============ PRICE DATA FETCHING ============
 
-// Finnhub API - direct fetch (CORS enabled)
-async function fetchFinnhub(ticker) {
-    const cacheKey = `fh:${ticker}`;
+function getPriceCacheKey(ticker) {
+    return `fh:${ticker}`;
+}
+
+async function fetchPrices(ticker) {
+    const cacheKey = getPriceCacheKey(ticker);
     const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Finnhub', fromCache: true };
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
+        return { prices: hit.data, source: 'Finnhub', fromCache: true };
+    }
 
     const to = Math.floor(Date.now() / 1000);
-    const from = to - Math.floor(25 * 365.25 * 24 * 60 * 60); // 25 years
-    const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=W&from=${from}&to=${to}&token=${FINNHUB_API_KEY}`;
+    const from = to - Math.floor(25 * 365.25 * 24 * 60 * 60);
 
-    const res = await fetch(url, { timeout: 12000 });
-    if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+    const data = await fetchFromFinnhub('/stock/candle', {
+        symbol: ticker,
+        resolution: 'W',
+        from,
+        to
+    });
 
-    const data = await res.json();
-
-    if (data.s !== 'ok' || !data.t || !data.c) {
-        throw new Error('Finnhub no data');
+    if (data?.s !== 'ok' || !Array.isArray(data?.c) || !Array.isArray(data?.t)) {
+        throw new Error('Invalid Finnhub candle response');
     }
 
-    const prices = [];
-    for (let i = 0; i < data.t.length; i++) {
-        if (data.c[i] != null && data.c[i] > 0) {
-            prices.push({ date: new Date(data.t[i] * 1000), close: data.c[i] });
-        }
-    }
-
-    if (prices.length < 10) throw new Error('Finnhub insufficient data');
+    const prices = data.t.map((ts, i) => ({
+        date: new Date(ts * 1000),
+        close: data.c[i]
+    })).filter(p => p.close != null && p.close > 0);
 
     _cache.set(cacheKey, { ts: Date.now(), data: prices });
     saveCache();
     return { prices, source: 'Finnhub', fromCache: false };
-}
-
-// Fetch prices from Finnhub only
-async function fetchPrices(ticker) {
-    return await fetchFinnhub(ticker);
 }
 
 // ============ Z-SCORE CALCULATIONS ============
@@ -432,102 +304,53 @@ function normalizePrices(prices) {
     return prices.map(p => ({ date: p.date, value: ((p.close / start) - 1) * 100 }));
 }
 
-// ============ HOLDINGS DATA (SSGA XLSX + FALLBACK) ============
+// ============ HOLDINGS DATA (FINNHUB) ============
 
-async function fetchSSGAHoldings(etfTicker) {
+async function fetchFinnhubHoldings(etfTicker) {
     const cacheKey = `holdings:${etfTicker}`;
     const hit = _cache.get(cacheKey);
     if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
 
-    const url = `https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-${etfTicker.toLowerCase()}.xlsx`;
-    
-    try {
-        const buf = await fetchWithRaceBinary(url, 20000);
-        const wb = XLSX.read(buf, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+    const data = await fetchFromFinnhub('/etf/holdings', { symbol: etfTicker });
+    const holdings = (data?.holdings || []).map(h => {
+        const ticker = (h.symbol || h.code || '').trim().toUpperCase();
+        const name = (h.name || h.description || ticker || '').trim();
+        const weight = Number(h.portfolioPercent ?? h.percent ?? h.weight ?? 0) || 0;
+        return ticker ? { ticker, name, weight } : null;
+    }).filter(Boolean);
 
-        // Find header row with "Ticker"
-        let headerIdx = rows.findIndex(r => r && r.some(c => String(c).trim().toLowerCase() === 'ticker'));
-        if (headerIdx < 0) return [];
-
-        const header = rows[headerIdx].map(x => String(x || '').trim().toLowerCase());
-        const tickerCol = header.findIndex(h => h === 'ticker');
-        const weightCol = header.findIndex(h => h.includes('weight'));
-        
-        if (tickerCol < 0) return [];
-
-        const holdings = [];
-        for (let i = headerIdx + 1; i < rows.length; i++) {
-            const t = String(rows[i]?.[tickerCol] || '').trim().toUpperCase();
-            if (!t || t === '-' || t.length > 10) continue;
-            if (t.includes(' ') || t.includes('/')) continue; // Skip non-equity
-            
-            let weight = 0;
-            if (weightCol >= 0) {
-                const w = rows[i]?.[weightCol];
-                weight = typeof w === 'number' ? w : parseFloat(String(w).replace('%', '')) || 0;
-            }
-            
-            holdings.push({ ticker: t, weight });
-        }
-
-        // Sort by weight descending, dedupe
-        holdings.sort((a, b) => b.weight - a.weight);
-        const seen = new Set();
-        const unique = holdings.filter(h => {
-            if (seen.has(h.ticker)) return false;
-            seen.add(h.ticker);
-            return true;
-        }).slice(0, 100);
-        
-        _cache.set(cacheKey, { ts: Date.now(), data: unique });
-        saveCache();
-        return unique;
-    } catch (e) {
-        console.log(`SSGA holdings fetch failed for ${etfTicker}:`, e.message);
-        return [];
+    holdings.sort((a, b) => b.weight - a.weight);
+    const unique = [];
+    const seen = new Set();
+    for (const h of holdings) {
+        if (seen.has(h.ticker)) continue;
+        seen.add(h.ticker);
+        unique.push(h);
     }
+
+    _cache.set(cacheKey, { ts: Date.now(), data: unique.slice(0, 100) });
+    saveCache();
+    return unique.slice(0, 100);
 }
 
-// Finnhub quote for a single symbol
 async function fetchFinnhubQuote(symbol) {
-    const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (!data.c || data.c === 0) throw new Error('No quote data');
-    return {
+    const cacheKey = `quote:${symbol}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data; // 5 minute cache
+
+    const data = await fetchFromFinnhub('/quote', { symbol });
+    const quote = {
         symbol,
-        regularMarketPrice: data.c,
-        regularMarketChangePercent: data.dp || 0,
-        regularMarketChange: data.d || 0,
-        regularMarketPreviousClose: data.pc || 0,
-        regularMarketOpen: data.o || 0,
-        regularMarketDayHigh: data.h || 0,
-        regularMarketDayLow: data.l || 0
+        price: data?.c ?? 0,
+        change: data?.dp ?? 0,
+        volume: data?.v ?? 0
     };
+
+    _cache.set(cacheKey, { ts: Date.now(), data: quote });
+    return quote;
 }
 
-// Fetch quotes for multiple symbols using Finnhub (parallel with throttling)
-async function fetchQuotes(symbols) {
-    if (!symbols.length) return [];
-
-    const results = await mapLimit(symbols, 5, async (symbol) => {
-        try {
-            return await fetchFinnhubQuote(symbol);
-        } catch (e) {
-            console.log(`Finnhub quote failed for ${symbol}: ${e.message}`);
-            return null;
-        }
-    });
-
-    return results
-        .filter(r => r.status === 'fulfilled' && r.value)
-        .map(r => r.value);
-}
-
-async function calculateCoMoveScore(symbol, sectorIndex) {
+async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
     try {
         const { prices } = await fetchPrices(symbol);
         const stockReturns = calcWeeklyReturns(prices.slice(-110));
@@ -539,23 +362,23 @@ async function calculateCoMoveScore(symbol, sectorIndex) {
             pairs.push({ stock: r.value, sector: sv });
         }
 
-        if (pairs.length < 8) return null;
+        if (pairs.length < 8 || sectorStats.std < 1e-6 || sectorStats.variance < 1e-6) return null;
 
         const stockVals = pairs.map(p => p.stock);
         const sectorVals = pairs.map(p => p.sector);
         const stockStats = calcReturnStats(stockVals);
-        const pairedSectorStats = calcReturnStats(sectorVals);
+        const sectorMean = sectorVals.reduce((a, b) => a + b, 0) / sectorVals.length;
 
-        if (stockStats.std < 1e-6 || pairedSectorStats.std < 1e-6) return null;
+        if (stockStats.std < 1e-6) return null;
 
         let cov = 0;
         for (let i = 0; i < pairs.length; i++) {
-            cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - pairedSectorStats.mean);
+            cov += (stockVals[i] - stockStats.mean) * (sectorVals[i] - sectorMean);
         }
         cov /= Math.max(1, pairs.length - 1);
 
-        const corr = cov / (stockStats.std * pairedSectorStats.std);
-        const beta = cov / pairedSectorStats.variance;
+        const corr = cov / (stockStats.std * sectorStats.std);
+        const beta = cov / sectorStats.variance;
 
         if (!isFinite(corr) || !isFinite(beta) || corr <= 0 || beta <= 0) return null;
 
@@ -572,69 +395,51 @@ async function fetchHoldingsData(sectorTicker) {
     const hit = _cache.get(cacheKey);
     if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data; // 5 min cache
 
-    let holdings = [];
-    let hasWeights = false;
-    
-    // Fetch live holdings from SSGA for supported ETFs
-    if (SSGA_ETFS.has(sectorTicker)) {
-        holdings = await fetchSSGAHoldings(sectorTicker);
-        hasWeights = holdings.length > 0 && holdings[0].weight > 0;
-    }
+    const holdings = await fetchFinnhubHoldings(sectorTicker);
 
     if (!holdings.length) return [];
 
-    // Extract tickers for quote fetch
-    const tickers = holdings.map(h => h.ticker || h);
+    const quoteResults = await mapLimit(holdings.slice(0, 50), 5, async (h) => ({
+        ...h,
+        ...(await fetchFinnhubQuote(h.ticker))
+    }));
 
-    // Fetch quotes for holdings from Finnhub
-    const quotes = await fetchQuotes(tickers.slice(0, 50));
+    let results = quoteResults
+        .filter(r => r.status === 'fulfilled' && r.value)
+        .map(r => ({
+            symbol: r.value.symbol,
+            name: (r.value.name || r.value.symbol || '').substring(0, 28) || r.value.symbol,
+            price: r.value.price,
+            change: r.value.change,
+            volume: r.value.volume,
+            weight: r.value.weight || 0
+        }));
 
-    if (!quotes.length) return [];
-    
-    // Build quote map
-    const quoteMap = new Map();
-    quotes.forEach(q => quoteMap.set(q.symbol, q));
-    
-    // Build results with weight info
-    let results = holdings.slice(0, 50).map(h => {
-        const ticker = h.ticker || h;
-        const q = quoteMap.get(ticker);
-        if (!q) return null;
-        return {
-            symbol: q.symbol,
-            name: (q.shortName || q.longName || q.symbol).substring(0, 28),
-            price: q.regularMarketPrice || 0,
-            change: q.regularMarketChangePercent || 0,
-            volume: q.regularMarketVolume || 0,
-            weight: h.weight || 0
-        };
-    }).filter(Boolean);
-
-    // Sort by weight if available, otherwise by volume
-    if (hasWeights) {
-        results.sort((a, b) => b.weight - a.weight);
-    } else {
-        results.sort((a, b) => b.volume - a.volume);
-    }
+    // Sort by weight, fallback to volume when weights are missing
+    results.sort((a, b) => {
+        if (a.weight === b.weight) return (b.volume || 0) - (a.volume || 0);
+        return (b.weight || 0) - (a.weight || 0);
+    });
 
     // Calculate which holdings move most with the sector (beta * correlation)
     try {
         const sectorPriceData = await fetchPrices(sectorTicker);
         const sectorReturns = calcWeeklyReturns(sectorPriceData.prices.slice(-110));
+        const sectorStats = calcReturnStats(sectorReturns.map(r => r.value));
 
-        if (sectorReturns.length >= 10) {
+        if (sectorStats.count >= 10 && sectorStats.variance > 1e-6) {
             const sectorIndex = buildReturnIndex(sectorReturns);
             const scored = await mapLimit(results.slice(0, 15), 3, async r => ({
                 ...r,
-                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex)
+                coMoveScore: await calculateCoMoveScore(r.symbol, sectorIndex, sectorStats)
             }));
 
-            const scoredResults = scored
+            const scoredValues = scored
                 .filter(s => s.status === 'fulfilled' && s.value)
                 .map(s => s.value);
 
-            if (scoredResults.some(s => s.coMoveScore != null)) {
-                results = scoredResults.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
+            if (scoredValues.some(s => s.coMoveScore != null)) {
+                results = scoredValues.sort((a, b) => (b.coMoveScore ?? -Infinity) - (a.coMoveScore ?? -Infinity));
             }
         }
     } catch (e) {
@@ -700,8 +505,8 @@ function calcSMA(prices, period) {
 
 // Calculate rotation trigger: Z-score setup + trend confirmation
 function calcRotationTrigger(sectorTicker, benchTicker) {
-    const sCache = _cache.get(`y:${sectorTicker}`) || _cache.get(`s:${sectorTicker}`);
-    const bCache = _cache.get(`y:${benchTicker}`) || _cache.get(`s:${benchTicker}`);
+    const sCache = _cache.get(getPriceCacheKey(sectorTicker));
+    const bCache = _cache.get(getPriceCacheKey(benchTicker));
     
     if (!sCache?.data || !bCache?.data) return null;
     
@@ -942,8 +747,8 @@ function createPriceChart(ticker, color, bench) {
     if (!canvas) return;
     if (priceChartInstance) priceChartInstance.destroy();
     
-    const sCache = _cache.get(`y:${ticker}`) || _cache.get(`s:${ticker}`);
-    const bCache = _cache.get(`y:${bench}`) || _cache.get(`s:${bench}`);
+    const sCache = _cache.get(getPriceCacheKey(ticker));
+    const bCache = _cache.get(getPriceCacheKey(bench));
     if (!sCache?.data || !bCache?.data) return;
     
     const start = new Date(Math.max(sCache.data[0].date, bCache.data[0].date));
