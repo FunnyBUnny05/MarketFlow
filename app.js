@@ -108,7 +108,7 @@ async function fetchFromFinnhub(path, params = {}) {
 async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
     let idx = 0;
-    
+
     const worker = async () => {
         while (idx < items.length) {
             const i = idx++;
@@ -119,19 +119,182 @@ async function mapLimit(items, limit, fn) {
             }
         }
     };
-    
+
     await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
     return results;
 }
 
-// ============ PRICE DATA FETCHING ============
+// ============ CORS PROXY UTILITIES (for Yahoo/Stooq) ============
 
-function getPriceCacheKey(ticker) {
-    return `fh:${ticker}`;
+const proxyHealth = {
+    'allorigins': { failures: 0, disabledUntil: 0 },
+    'corsproxy': { failures: 0, disabledUntil: 0 },
+    'codetabs': { failures: 0, disabledUntil: 0 }
+};
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 10 * 60 * 1000;
+
+function getActiveProxies(url) {
+    const now = Date.now();
+    const allProxies = [
+        { name: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+        { name: 'corsproxy', url: `https://corsproxy.io/?${encodeURIComponent(url)}` },
+        { name: 'codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
+    ];
+
+    return allProxies.filter(p => {
+        const health = proxyHealth[p.name];
+        if (health.disabledUntil > now) return false;
+        if (health.failures >= CIRCUIT_BREAKER_THRESHOLD) health.failures = 0;
+        return true;
+    });
 }
 
+function recordProxySuccess(proxyName) {
+    if (proxyHealth[proxyName]) {
+        proxyHealth[proxyName].failures = 0;
+        proxyHealth[proxyName].disabledUntil = 0;
+    }
+}
+
+function recordProxyFailure(proxyName) {
+    if (proxyHealth[proxyName]) {
+        proxyHealth[proxyName].failures++;
+        if (proxyHealth[proxyName].failures >= CIRCUIT_BREAKER_THRESHOLD) {
+            proxyHealth[proxyName].disabledUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+        }
+    }
+}
+
+async function fetchWithProxy(url, timeoutMs = 12000) {
+    const proxies = getActiveProxies(url);
+
+    if (proxies.length === 0) {
+        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
+        return fetchWithProxy(url, timeoutMs);
+    }
+
+    const controllers = proxies.map(() => new AbortController());
+    const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
+
+    try {
+        const wrapped = proxies.map((p, i) => (async () => {
+            try {
+                const res = await fetch(p.url, { signal: controllers[i].signal });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const text = await res.text();
+                const t = text.trim();
+                if (!(t.startsWith('{') || t.startsWith('[') || t.startsWith('Date,'))) {
+                    throw new Error('Invalid response');
+                }
+                recordProxySuccess(p.name);
+                return { text, proxyName: p.name };
+            } catch (e) {
+                recordProxyFailure(p.name);
+                throw e;
+            }
+        })());
+
+        const result = await new Promise((resolve, reject) => {
+            let pending = wrapped.length, lastErr;
+            wrapped.forEach(p =>
+                p.then(resolve).catch(err => {
+                    lastErr = err;
+                    pending--;
+                    if (pending === 0) reject(lastErr);
+                })
+            );
+        });
+
+        controllers.forEach(c => c.abort());
+        return result.text;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// ============ ETF PRICE DATA FETCHING (Yahoo/Stooq) ============
+
+async function fetchYahoo(ticker) {
+    const cacheKey = `y:${ticker}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Yahoo', fromCache: true };
+
+    const p2 = Math.floor(Date.now() / 1000);
+    const p1 = p2 - Math.floor(25 * 365.25 * 24 * 60 * 60);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${p1}&period2=${p2}&interval=1wk`;
+
+    const text = await fetchWithProxy(url);
+    const data = JSON.parse(text);
+
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error('No data');
+
+    const ts = result.timestamp || [];
+    const closes = result.indicators?.adjclose?.[0]?.adjclose || result.indicators?.quote?.[0]?.close || [];
+
+    const prices = [];
+    for (let i = 0; i < ts.length; i++) {
+        if (closes[i] != null && closes[i] > 0) {
+            prices.push({ date: new Date(ts[i] * 1000), close: closes[i] });
+        }
+    }
+
+    _cache.set(cacheKey, { ts: Date.now(), data: prices });
+    saveCache();
+    return { prices, source: 'Yahoo', fromCache: false };
+}
+
+async function fetchStooq(ticker) {
+    const cacheKey = `s:${ticker}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Stooq', fromCache: true };
+
+    const sym = `${ticker.toLowerCase()}.us`;
+    const url = `https://stooq.com/q/d/l/?s=${sym}&i=w`;
+    const text = await fetchWithProxy(url, 15000);
+
+    if (!text.startsWith('Date,')) throw new Error('Invalid Stooq');
+
+    const lines = text.split(/\r?\n/);
+    lines.shift();
+
+    const prices = [];
+    for (const line of lines) {
+        const cols = line.split(',');
+        const close = Number(cols[4]);
+        if (cols[0] && close > 0) prices.push({ date: new Date(cols[0]), close });
+    }
+    prices.sort((a, b) => a.date - b.date);
+
+    _cache.set(cacheKey, { ts: Date.now(), data: prices });
+    saveCache();
+    return { prices, source: 'Stooq', fromCache: false };
+}
+
+// Fetch ETF prices - Yahoo first, Stooq fallback
 async function fetchPrices(ticker) {
-    const cacheKey = getPriceCacheKey(ticker);
+    const yKey = `y:${ticker}`, sKey = `s:${ticker}`;
+    const yHit = _cache.get(yKey);
+    const sHit = _cache.get(sKey);
+
+    if (yHit && Date.now() - yHit.ts < CACHE_TTL_MS) {
+        return { prices: yHit.data, source: 'Yahoo', fromCache: true };
+    }
+    if (sHit && Date.now() - sHit.ts < CACHE_TTL_MS) {
+        return { prices: sHit.data, source: 'Stooq', fromCache: true };
+    }
+
+    try {
+        return await fetchYahoo(ticker);
+    } catch {
+        return await fetchStooq(ticker);
+    }
+}
+
+// Fetch individual stock prices from Finnhub (for co-move calculation)
+async function fetchStockPrices(ticker) {
+    const cacheKey = `fh:${ticker}`;
     const hit = _cache.get(cacheKey);
     if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
         return { prices: hit.data, source: 'Finnhub', fromCache: true };
@@ -352,7 +515,7 @@ async function fetchFinnhubQuote(symbol) {
 
 async function calculateCoMoveScore(symbol, sectorIndex, sectorStats) {
     try {
-        const { prices } = await fetchPrices(symbol);
+        const { prices } = await fetchStockPrices(symbol);
         const stockReturns = calcWeeklyReturns(prices.slice(-110));
 
         const pairs = [];
