@@ -32,13 +32,6 @@ const SSGA_ETFS = new Set([
     'XHB', 'XOP', 'XME', 'KRE', 'XBI'
 ]);
 
-// Fallback holdings for non-SSGA ETFs
-const FALLBACK_HOLDINGS = {
-    'SMH': ['NVDA', 'AMD', 'AVGO', 'QCOM', 'TXN', 'INTC', 'ADI', 'MU', 'AMAT', 'LRCX', 'KLAC', 'MRVL', 'NXPI', 'ON', 'MPWR'],
-    'ITB': ['DHI', 'LEN', 'NVR', 'PHM', 'TOL', 'BLDR', 'MHK', 'TMHC', 'KBH', 'MDC', 'MTH', 'MAS', 'LGIH', 'CCS', 'BLD'],
-    'IYT': ['UNP', 'UPS', 'FDX', 'CSX', 'NSC', 'DAL', 'LUV', 'UAL', 'ODFL', 'JBHT', 'EXPD', 'XPO', 'CHRW', 'LSTR', 'AAL'],
-};
-
 let selectedSector = null;
 let sectorZScores = {};
 let sectorDataQuality = {}; // Track data quality per sector
@@ -256,64 +249,7 @@ async function mapLimit(items, limit, fn) {
     return results;
 }
 
-// ============ PRICE DATA FETCHING ============
-
-async function fetchYahoo(ticker) {
-    const cacheKey = `y:${ticker}`;
-    const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Yahoo', fromCache: true };
-
-    const p2 = Math.floor(Date.now() / 1000);
-    const p1 = p2 - Math.floor(25 * 365.25 * 24 * 60 * 60);
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${p1}&period2=${p2}&interval=1wk`;
-
-    const text = await fetchWithRace(url);
-    const data = JSON.parse(text);
-    
-    const result = data?.chart?.result?.[0];
-    if (!result) throw new Error('No data');
-
-    const ts = result.timestamp || [];
-    const closes = result.indicators?.adjclose?.[0]?.adjclose || result.indicators?.quote?.[0]?.close || [];
-
-    const prices = [];
-    for (let i = 0; i < ts.length; i++) {
-        if (closes[i] != null && closes[i] > 0) {
-            prices.push({ date: new Date(ts[i] * 1000), close: closes[i] });
-        }
-    }
-
-    _cache.set(cacheKey, { ts: Date.now(), data: prices });
-    saveCache();
-    return { prices, source: 'Yahoo', fromCache: false };
-}
-
-async function fetchStooq(ticker) {
-    const cacheKey = `s:${ticker}`;
-    const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Stooq', fromCache: true };
-
-    const sym = `${ticker.toLowerCase()}.us`;
-    const url = `https://stooq.com/q/d/l/?s=${sym}&i=w`;
-    const text = await fetchWithRace(url, 15000);
-    
-    if (!text.startsWith('Date,')) throw new Error('Invalid Stooq');
-
-    const lines = text.split(/\r?\n/);
-    lines.shift();
-    
-    const prices = [];
-    for (const line of lines) {
-        const cols = line.split(',');
-        const close = Number(cols[4]);
-        if (cols[0] && close > 0) prices.push({ date: new Date(cols[0]), close });
-    }
-    prices.sort((a, b) => a.date - b.date);
-
-    _cache.set(cacheKey, { ts: Date.now(), data: prices });
-    saveCache();
-    return { prices, source: 'Stooq', fromCache: false };
-}
+// ============ PRICE DATA FETCHING (Finnhub Only) ============
 
 // Finnhub API - direct fetch (CORS enabled)
 async function fetchFinnhub(ticker) {
@@ -348,35 +284,9 @@ async function fetchFinnhub(ticker) {
     return { prices, source: 'Finnhub', fromCache: false };
 }
 
-// Stale-while-revalidate: return cached data immediately, refresh in background
+// Fetch prices from Finnhub only
 async function fetchPrices(ticker) {
-    const fhKey = `fh:${ticker}`, yKey = `y:${ticker}`, sKey = `s:${ticker}`;
-    const fhHit = _cache.get(fhKey);
-    const yHit = _cache.get(yKey);
-    const sHit = _cache.get(sKey);
-
-    // If we have fresh cache, use it (prefer Finnhub)
-    if (fhHit && Date.now() - fhHit.ts < CACHE_TTL_MS) {
-        return { prices: fhHit.data, source: 'Finnhub', fromCache: true };
-    }
-    if (yHit && Date.now() - yHit.ts < CACHE_TTL_MS) {
-        return { prices: yHit.data, source: 'Yahoo', fromCache: true };
-    }
-    if (sHit && Date.now() - sHit.ts < CACHE_TTL_MS) {
-        return { prices: sHit.data, source: 'Stooq', fromCache: true };
-    }
-
-    // Try Finnhub first (direct CORS), then Yahoo, then Stooq
-    try {
-        return await fetchFinnhub(ticker);
-    } catch (e) {
-        console.log(`Finnhub failed for ${ticker}: ${e.message}, trying Yahoo...`);
-        try {
-            return await fetchYahoo(ticker);
-        } catch {
-            return await fetchStooq(ticker);
-        }
-    }
+    return await fetchFinnhub(ticker);
 }
 
 // ============ Z-SCORE CALCULATIONS ============
@@ -580,22 +490,6 @@ async function fetchSSGAHoldings(etfTicker) {
     }
 }
 
-async function fetchYahooQuotes(symbols) {
-    if (!symbols.length) return [];
-
-    // Yahoo quotes endpoint - batch up to 200
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}`;
-
-    try {
-        const text = await fetchWithRace(url, 15000);
-        const data = JSON.parse(text);
-        return data?.quoteResponse?.result || [];
-    } catch (e) {
-        console.log('Yahoo quotes failed:', e.message);
-        return [];
-    }
-}
-
 // Finnhub quote for a single symbol
 async function fetchFinnhubQuote(symbol) {
     const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
@@ -616,13 +510,14 @@ async function fetchFinnhubQuote(symbol) {
 }
 
 // Fetch quotes for multiple symbols using Finnhub (parallel with throttling)
-async function fetchFinnhubQuotes(symbols) {
+async function fetchQuotes(symbols) {
     if (!symbols.length) return [];
 
     const results = await mapLimit(symbols, 5, async (symbol) => {
         try {
             return await fetchFinnhubQuote(symbol);
         } catch (e) {
+            console.log(`Finnhub quote failed for ${symbol}: ${e.message}`);
             return null;
         }
     });
@@ -630,23 +525,6 @@ async function fetchFinnhubQuotes(symbols) {
     return results
         .filter(r => r.status === 'fulfilled' && r.value)
         .map(r => r.value);
-}
-
-// Unified quotes fetcher - tries Finnhub first, falls back to Yahoo
-async function fetchQuotes(symbols) {
-    if (!symbols.length) return [];
-
-    try {
-        const finnhubQuotes = await fetchFinnhubQuotes(symbols);
-        if (finnhubQuotes.length >= symbols.length * 0.5) {
-            console.log(`Finnhub quotes: ${finnhubQuotes.length}/${symbols.length}`);
-            return finnhubQuotes;
-        }
-        throw new Error('Finnhub returned insufficient quotes');
-    } catch (e) {
-        console.log(`Finnhub quotes failed: ${e.message}, trying Yahoo...`);
-        return await fetchYahooQuotes(symbols);
-    }
 }
 
 async function calculateCoMoveScore(symbol, sectorIndex) {
@@ -697,23 +575,18 @@ async function fetchHoldingsData(sectorTicker) {
     let holdings = [];
     let hasWeights = false;
     
-    // Try SSGA holdings for supported ETFs
+    // Fetch live holdings from SSGA for supported ETFs
     if (SSGA_ETFS.has(sectorTicker)) {
         holdings = await fetchSSGAHoldings(sectorTicker);
         hasWeights = holdings.length > 0 && holdings[0].weight > 0;
     }
-    
-    // Fallback to hardcoded list (no weights)
-    if (!holdings.length && FALLBACK_HOLDINGS[sectorTicker]) {
-        holdings = FALLBACK_HOLDINGS[sectorTicker].map(t => ({ ticker: t, weight: 0 }));
-    }
-    
+
     if (!holdings.length) return [];
-    
+
     // Extract tickers for quote fetch
     const tickers = holdings.map(h => h.ticker || h);
-    
-    // Fetch quotes for holdings (tries Finnhub first, falls back to Yahoo)
+
+    // Fetch quotes for holdings from Finnhub
     const quotes = await fetchQuotes(tickers.slice(0, 50));
 
     if (!quotes.length) return [];
