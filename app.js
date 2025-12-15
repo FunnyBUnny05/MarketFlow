@@ -266,6 +266,14 @@ async function fetchBinaryWithProxy(url, timeoutMs = 15000) {
 
 // ============ ETF PRICE DATA FETCHING (Yahoo/Stooq) ============
 
+// Get the cache key for a ticker's price data (Yahoo or Stooq)
+function getPriceCacheKey(ticker) {
+    // Check Yahoo cache first, then Stooq
+    if (_cache.has(`y:${ticker}`)) return `y:${ticker}`;
+    if (_cache.has(`s:${ticker}`)) return `s:${ticker}`;
+    return `y:${ticker}`; // Default to Yahoo
+}
+
 async function fetchYahoo(ticker) {
     const cacheKey = `y:${ticker}`;
     const hit = _cache.get(cacheKey);
