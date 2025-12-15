@@ -1,6 +1,9 @@
 // Sector Z-Score Dashboard v5 - Fixed
 // Proper fetch handling, throttled concurrency, real ETF holdings
 
+// Finnhub API configuration
+const FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
+
 const SECTORS = [
     { ticker: 'XLB', name: 'Materials', color: '#f97316' },
     { ticker: 'XLE', name: 'Energy', color: '#3b82f6' },
@@ -312,25 +315,67 @@ async function fetchStooq(ticker) {
     return { prices, source: 'Stooq', fromCache: false };
 }
 
+// Finnhub API - direct fetch (CORS enabled)
+async function fetchFinnhub(ticker) {
+    const cacheKey = `fh:${ticker}`;
+    const hit = _cache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return { prices: hit.data, source: 'Finnhub', fromCache: true };
+
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - Math.floor(25 * 365.25 * 24 * 60 * 60); // 25 years
+    const url = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=W&from=${from}&to=${to}&token=${FINNHUB_API_KEY}`;
+
+    const res = await fetch(url, { timeout: 12000 });
+    if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+
+    const data = await res.json();
+
+    if (data.s !== 'ok' || !data.t || !data.c) {
+        throw new Error('Finnhub no data');
+    }
+
+    const prices = [];
+    for (let i = 0; i < data.t.length; i++) {
+        if (data.c[i] != null && data.c[i] > 0) {
+            prices.push({ date: new Date(data.t[i] * 1000), close: data.c[i] });
+        }
+    }
+
+    if (prices.length < 10) throw new Error('Finnhub insufficient data');
+
+    _cache.set(cacheKey, { ts: Date.now(), data: prices });
+    saveCache();
+    return { prices, source: 'Finnhub', fromCache: false };
+}
+
 // Stale-while-revalidate: return cached data immediately, refresh in background
 async function fetchPrices(ticker) {
-    const yKey = `y:${ticker}`, sKey = `s:${ticker}`;
+    const fhKey = `fh:${ticker}`, yKey = `y:${ticker}`, sKey = `s:${ticker}`;
+    const fhHit = _cache.get(fhKey);
     const yHit = _cache.get(yKey);
     const sHit = _cache.get(sKey);
-    
-    // If we have fresh cache, use it
+
+    // If we have fresh cache, use it (prefer Finnhub)
+    if (fhHit && Date.now() - fhHit.ts < CACHE_TTL_MS) {
+        return { prices: fhHit.data, source: 'Finnhub', fromCache: true };
+    }
     if (yHit && Date.now() - yHit.ts < CACHE_TTL_MS) {
         return { prices: yHit.data, source: 'Yahoo', fromCache: true };
     }
     if (sHit && Date.now() - sHit.ts < CACHE_TTL_MS) {
         return { prices: sHit.data, source: 'Stooq', fromCache: true };
     }
-    
-    // Try Yahoo first, fallback to Stooq
-    try { 
-        return await fetchYahoo(ticker); 
-    } catch { 
-        return await fetchStooq(ticker); 
+
+    // Try Finnhub first (direct CORS), then Yahoo, then Stooq
+    try {
+        return await fetchFinnhub(ticker);
+    } catch (e) {
+        console.log(`Finnhub failed for ${ticker}: ${e.message}, trying Yahoo...`);
+        try {
+            return await fetchYahoo(ticker);
+        } catch {
+            return await fetchStooq(ticker);
+        }
     }
 }
 
@@ -537,10 +582,10 @@ async function fetchSSGAHoldings(etfTicker) {
 
 async function fetchYahooQuotes(symbols) {
     if (!symbols.length) return [];
-    
+
     // Yahoo quotes endpoint - batch up to 200
     const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}`;
-    
+
     try {
         const text = await fetchWithRace(url, 15000);
         const data = JSON.parse(text);
@@ -548,6 +593,59 @@ async function fetchYahooQuotes(symbols) {
     } catch (e) {
         console.log('Yahoo quotes failed:', e.message);
         return [];
+    }
+}
+
+// Finnhub quote for a single symbol
+async function fetchFinnhubQuote(symbol) {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.c || data.c === 0) throw new Error('No quote data');
+    return {
+        symbol,
+        regularMarketPrice: data.c,
+        regularMarketChangePercent: data.dp || 0,
+        regularMarketChange: data.d || 0,
+        regularMarketPreviousClose: data.pc || 0,
+        regularMarketOpen: data.o || 0,
+        regularMarketDayHigh: data.h || 0,
+        regularMarketDayLow: data.l || 0
+    };
+}
+
+// Fetch quotes for multiple symbols using Finnhub (parallel with throttling)
+async function fetchFinnhubQuotes(symbols) {
+    if (!symbols.length) return [];
+
+    const results = await mapLimit(symbols, 5, async (symbol) => {
+        try {
+            return await fetchFinnhubQuote(symbol);
+        } catch (e) {
+            return null;
+        }
+    });
+
+    return results
+        .filter(r => r.status === 'fulfilled' && r.value)
+        .map(r => r.value);
+}
+
+// Unified quotes fetcher - tries Finnhub first, falls back to Yahoo
+async function fetchQuotes(symbols) {
+    if (!symbols.length) return [];
+
+    try {
+        const finnhubQuotes = await fetchFinnhubQuotes(symbols);
+        if (finnhubQuotes.length >= symbols.length * 0.5) {
+            console.log(`Finnhub quotes: ${finnhubQuotes.length}/${symbols.length}`);
+            return finnhubQuotes;
+        }
+        throw new Error('Finnhub returned insufficient quotes');
+    } catch (e) {
+        console.log(`Finnhub quotes failed: ${e.message}, trying Yahoo...`);
+        return await fetchYahooQuotes(symbols);
     }
 }
 
@@ -615,8 +713,8 @@ async function fetchHoldingsData(sectorTicker) {
     // Extract tickers for quote fetch
     const tickers = holdings.map(h => h.ticker || h);
     
-    // Fetch quotes for holdings
-    const quotes = await fetchYahooQuotes(tickers.slice(0, 50));
+    // Fetch quotes for holdings (tries Finnhub first, falls back to Yahoo)
+    const quotes = await fetchQuotes(tickers.slice(0, 50));
 
     if (!quotes.length) return [];
     
