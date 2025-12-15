@@ -23,6 +23,12 @@ const SECTORS = [
     { ticker: 'IYT', name: 'Transportation', color: '#38bdf8' },
 ];
 
+// SSGA ETFs with daily holdings XLSX
+const SSGA_ETFS = new Set([
+    'XLB', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLU', 'XLV', 'XLY', 'XLRE', 'XLC',
+    'XHB', 'XOP', 'XME', 'KRE', 'XBI'
+]);
+
 const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1';
 const FINNHUB_API_KEY_STORAGE_KEY = 'finnhubApiKey';
 const DEFAULT_FINNHUB_API_KEY = 'd501pmhr01qsabpqjea0d501pmhr01qsabpqjeag';
@@ -208,6 +214,51 @@ async function fetchWithProxy(url, timeoutMs = 12000) {
 
         controllers.forEach(c => c.abort());
         return result.text;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// Binary fetch for XLSX files
+async function fetchBinaryWithProxy(url, timeoutMs = 15000) {
+    const proxies = getActiveProxies(url);
+
+    if (proxies.length === 0) {
+        Object.values(proxyHealth).forEach(h => { h.failures = 0; h.disabledUntil = 0; });
+        return fetchBinaryWithProxy(url, timeoutMs);
+    }
+
+    const controllers = proxies.map(() => new AbortController());
+    const timeout = setTimeout(() => controllers.forEach(c => c.abort()), timeoutMs);
+
+    try {
+        const result = await new Promise((resolve, reject) => {
+            let pending = proxies.length, lastErr;
+            proxies.forEach((p, i) => {
+                fetch(p.url, { signal: controllers[i].signal })
+                    .then(r => {
+                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                        return r.arrayBuffer();
+                    })
+                    .then(buf => {
+                        const b = new Uint8Array(buf);
+                        if (b.length < 4 || b[0] !== 0x50 || b[1] !== 0x4B) {
+                            throw new Error('Not XLSX');
+                        }
+                        recordProxySuccess(p.name);
+                        resolve(buf);
+                    })
+                    .catch(err => {
+                        recordProxyFailure(p.name);
+                        lastErr = err;
+                        pending--;
+                        if (pending === 0) reject(lastErr);
+                    });
+            });
+        });
+
+        controllers.forEach(c => c.abort());
+        return result;
     } finally {
         clearTimeout(timeout);
     }
@@ -467,33 +518,62 @@ function normalizePrices(prices) {
     return prices.map(p => ({ date: p.date, value: ((p.close / start) - 1) * 100 }));
 }
 
-// ============ HOLDINGS DATA (FINNHUB) ============
+// ============ HOLDINGS DATA (SSGA XLSX) ============
 
-async function fetchFinnhubHoldings(etfTicker) {
+async function fetchSSGAHoldings(etfTicker) {
     const cacheKey = `holdings:${etfTicker}`;
     const hit = _cache.get(cacheKey);
     if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
 
-    const data = await fetchFromFinnhub('/etf/holdings', { symbol: etfTicker });
-    const holdings = (data?.holdings || []).map(h => {
-        const ticker = (h.symbol || h.code || '').trim().toUpperCase();
-        const name = (h.name || h.description || ticker || '').trim();
-        const weight = Number(h.portfolioPercent ?? h.percent ?? h.weight ?? 0) || 0;
-        return ticker ? { ticker, name, weight } : null;
-    }).filter(Boolean);
+    const url = `https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-${etfTicker.toLowerCase()}.xlsx`;
 
-    holdings.sort((a, b) => b.weight - a.weight);
-    const unique = [];
-    const seen = new Set();
-    for (const h of holdings) {
-        if (seen.has(h.ticker)) continue;
-        seen.add(h.ticker);
-        unique.push(h);
+    try {
+        const buf = await fetchBinaryWithProxy(url, 20000);
+        const wb = XLSX.read(buf, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+
+        let headerIdx = rows.findIndex(r => r && r.some(c => String(c).trim().toLowerCase() === 'ticker'));
+        if (headerIdx < 0) return [];
+
+        const header = rows[headerIdx].map(x => String(x || '').trim().toLowerCase());
+        const tickerCol = header.findIndex(h => h === 'ticker');
+        const weightCol = header.findIndex(h => h.includes('weight'));
+        const nameCol = header.findIndex(h => h === 'name' || h === 'security name');
+
+        if (tickerCol < 0) return [];
+
+        const holdings = [];
+        for (let i = headerIdx + 1; i < rows.length; i++) {
+            const t = String(rows[i]?.[tickerCol] || '').trim().toUpperCase();
+            if (!t || t === '-' || t.length > 10) continue;
+            if (t.includes(' ') || t.includes('/')) continue;
+
+            let weight = 0;
+            if (weightCol >= 0) {
+                const w = rows[i]?.[weightCol];
+                weight = typeof w === 'number' ? w : parseFloat(String(w).replace('%', '')) || 0;
+            }
+
+            const name = nameCol >= 0 ? String(rows[i]?.[nameCol] || '').trim() : t;
+            holdings.push({ ticker: t, name, weight });
+        }
+
+        holdings.sort((a, b) => b.weight - a.weight);
+        const seen = new Set();
+        const unique = holdings.filter(h => {
+            if (seen.has(h.ticker)) return false;
+            seen.add(h.ticker);
+            return true;
+        }).slice(0, 100);
+
+        _cache.set(cacheKey, { ts: Date.now(), data: unique });
+        saveCache();
+        return unique;
+    } catch (e) {
+        console.log(`SSGA holdings fetch failed for ${etfTicker}:`, e.message);
+        return [];
     }
-
-    _cache.set(cacheKey, { ts: Date.now(), data: unique.slice(0, 100) });
-    saveCache();
-    return unique.slice(0, 100);
 }
 
 async function fetchFinnhubQuote(symbol) {
@@ -558,7 +638,10 @@ async function fetchHoldingsData(sectorTicker) {
     const hit = _cache.get(cacheKey);
     if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data; // 5 min cache
 
-    const holdings = await fetchFinnhubHoldings(sectorTicker);
+    // Only fetch holdings for SSGA ETFs
+    if (!SSGA_ETFS.has(sectorTicker)) return [];
+
+    const holdings = await fetchSSGAHoldings(sectorTicker);
 
     if (!holdings.length) return [];
 
