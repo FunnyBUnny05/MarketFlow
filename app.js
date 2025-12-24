@@ -1288,7 +1288,21 @@ function renderChart() {
 
                     <div class="metric-group">
                         <div class="metric-label">Coverage</div>
-                        <div class="metric-value">${quality.pointCount || 0} weeks</div>
+                        <div class="metric-value">${(() => {
+                            const weeks = quality.pointCount || 0;
+                            const years = Math.floor(weeks / 52);
+                            const remainingWeeks = weeks % 52;
+                            const months = Math.floor(remainingWeeks / 4.33);
+                            if (years > 0 && months > 0) {
+                                return `${years} ${years === 1 ? 'year' : 'years'}, ${months} ${months === 1 ? 'month' : 'months'}`;
+                            } else if (years > 0) {
+                                return `${years} ${years === 1 ? 'year' : 'years'}`;
+                            } else if (weeks > 4) {
+                                return `${months} ${months === 1 ? 'month' : 'months'}`;
+                            } else {
+                                return `${weeks} ${weeks === 1 ? 'week' : 'weeks'}`;
+                            }
+                        })()}</div>
                         <div class="metric-sublabel">${quality.startDate ? quality.startDate.toLocaleDateString('en-US', {month: 'short', year: 'numeric'}) : '?'} to ${quality.endDate ? quality.endDate.toLocaleDateString('en-US', {month: 'short', year: 'numeric'}) : '?'}</div>
                     </div>
 
